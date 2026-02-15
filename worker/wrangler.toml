@@ -1,0 +1,9 @@
+name = "claude-bridge"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+account_id = "a0ae25dc6f7cb7db9d7f45ebb8dd0658"
+
+# KV namespace binding — ID filled in after `npx wrangler kv namespace create MESSAGES`
+[[kv_namespaces]]
+binding = "MESSAGES"
+id = "c824e1ad7af64b95afc37b68d465063a"
