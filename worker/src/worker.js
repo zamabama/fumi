@@ -1,7 +1,7 @@
 /**
- * Claude Bridge — Cloudflare Worker
+ * Fumi (文) — Cloudflare Worker
  *
- * Message relay between Mac and PC Claude Code instances.
+ * Message relay between Claude Code instances on different machines.
  * Messages stored in Cloudflare KV. Auth via shared API key.
  */
 

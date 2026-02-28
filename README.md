@@ -1,6 +1,8 @@
-# Claude Bridge
+# Fumi (文) — Message Bridge
 
 Two-way message relay between Claude Code instances on different machines. Send handovers, task direction, and status updates between Mac and PC (or any two machines) through a Cloudflare Worker.
+
+Named for 文 (*fumi*) — letter, message.
 
 ## Architecture
 
@@ -47,11 +49,11 @@ On each machine, add to the project's `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "claude-bridge": {
+    "fumi": {
       "command": "python3",
-      "args": ["/path/to/claude-bridge/mcp_server.py"],
+      "args": ["/path/to/fumi/mcp_server.py"],
       "env": {
-        "BRIDGE_WORKER_URL": "https://claude-bridge.<account>.workers.dev",
+        "BRIDGE_WORKER_URL": "https://fumi.<your-account>.workers.dev",
         "BRIDGE_API_KEY": "<your-shared-secret>",
         "BRIDGE_MACHINE_ID": "mac"
       }
@@ -77,9 +79,9 @@ Set `BRIDGE_MACHINE_ID` to `"mac"`, `"pc"`, or any identifier for that machine. 
 Add to your project's CLAUDE.md on both machines:
 
 ```markdown
-## Mac-PC Bridge
+## Fumi (文) — Message Bridge
 
-Check for messages at the start of every session:
+Check fumi at the start of every session:
 - Use `check_messages` to see unread count
 - Use `read_messages(unread_only=true)` to read pending messages
 - Act on any task direction or handover notes
@@ -102,7 +104,7 @@ Auth: `Authorization: Bearer <key>` header on all endpoints except `/health`.
 ## File Structure
 
 ```
-claude-bridge/
+fumi/
 ├── mcp_server.py        ← MCP server (Python, stdio)
 ├── requirements.txt     ← Python dependencies
 ├── README.md            ← This file
