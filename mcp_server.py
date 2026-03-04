@@ -4,6 +4,9 @@ Photon — Message Bridge MCP Server
 Gives Claude Code tools to send/read messages through the Cloudflare Worker.
 Runs on both Mac and PC. Machine identity set via BRIDGE_MACHINE_ID env var.
 
+Messages are scoped by project. If BRIDGE_PROJECT is set, agents only see
+messages addressed to their project (or broadcast messages with no project).
+
 Usage (stdio, via .mcp.json):
     python3 tools/photon/mcp_server.py
 """
@@ -18,6 +21,9 @@ WORKER_URL = os.environ.get("BRIDGE_WORKER_URL", "").rstrip("/")
 API_KEY = os.environ.get("BRIDGE_API_KEY", "")
 MACHINE_ID = os.environ.get("BRIDGE_MACHINE_ID", "unknown")
 PROJECT = os.environ.get("BRIDGE_PROJECT", "")
+
+# Composite identity: "mac/cheetos", "pc/autonomy", etc.
+IDENTITY = f"{MACHINE_ID}/{PROJECT}" if PROJECT else MACHINE_ID
 
 if not WORKER_URL:
     raise RuntimeError("BRIDGE_WORKER_URL environment variable is required")
@@ -45,14 +51,15 @@ def _headers():
 
 @mcp.tool(
     name="send_message",
-    description="Send a message to the other machine's Claude Code instance.",
+    description="Send a message to another Claude Code instance. Use 'to' to target a specific machine/project (e.g. 'mac/cheetos').",
 )
-async def send_message(content: str, tags: list[str] | None = None) -> dict:
+async def send_message(content: str, tags: list[str] | None = None, to: str | None = None) -> dict:
     """Send a message through the bridge.
 
     Args:
         content: The message text (handover notes, task direction, status updates, etc.)
         tags: Optional tags for categorization (e.g. ["vlt", "handover", "tracking"])
+        to: Target recipient (e.g. "mac/cheetos", "pc/autonomy"). Omit for broadcast.
     """
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -60,8 +67,9 @@ async def send_message(content: str, tags: list[str] | None = None) -> dict:
             headers=_headers(),
             json={
                 "content": content,
-                "from": MACHINE_ID,
+                "from": IDENTITY,
                 "project": PROJECT or None,
+                "to": to or None,
                 "tags": tags or [],
             },
             timeout=10,
@@ -72,31 +80,29 @@ async def send_message(content: str, tags: list[str] | None = None) -> dict:
 
 @mcp.tool(
     name="read_messages",
-    description="Read messages from the bridge, optionally filtered.",
+    description="Read messages from the bridge. Auto-filtered to your project — you only see messages addressed to you or broadcasts.",
 )
 async def read_messages(
     unread_only: bool = False,
     from_machine: str | None = None,
-    project: str | None = None,
     tag: str | None = None,
     limit: int = 20,
+    all_projects: bool = False,
 ) -> dict:
-    """Read messages, optionally filtered.
+    """Read messages, auto-filtered to this project's context.
 
     Args:
         unread_only: Only return unread messages
-        from_machine: Filter by sender ("mac" or "pc")
-        project: Filter by project name
+        from_machine: Filter by sender (e.g. "mac", "pc", "mac/cheetos")
         tag: Filter by tag
         limit: Maximum number of messages to return (default 20)
+        all_projects: Set True to see ALL messages (ignores project filter)
     """
     params = {"limit": str(limit)}
     if unread_only:
         params["unread"] = "true"
     if from_machine:
         params["from"] = from_machine
-    if project:
-        params["project"] = project
     if tag:
         params["tag"] = tag
 
@@ -108,18 +114,36 @@ async def read_messages(
             timeout=10,
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+
+    # Auto-filter: only show messages routed to this project (or broadcasts)
+    if PROJECT and not all_projects:
+        messages = data.get("messages", [])
+        filtered = []
+        for msg in messages:
+            msg_to = msg.get("to")
+            msg_project = msg.get("project")
+            # Show if: explicitly addressed to us, OR broadcast (no 'to'), OR same project
+            if msg_to == IDENTITY:
+                filtered.append(msg)
+            elif msg_to is None and (msg_project is None or msg_project == PROJECT):
+                filtered.append(msg)
+            # Skip messages addressed to a different identity
+        data["messages"] = filtered
+        data["count"] = len(filtered)
+
+    return data
 
 
 @mcp.tool(
     name="check_messages",
     description=(
-        "Quick check — how many unread messages are waiting? "
-        "Call this at the start of every session."
+        "Quick check — how many unread messages are waiting for YOU? "
+        "Auto-filtered to your project. Call this at the start of every session."
     ),
 )
 async def check_messages() -> dict:
-    """Check for unread messages. Returns count and latest sender info."""
+    """Check for unread messages addressed to this project. Returns count and latest sender info."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{WORKER_URL}/messages",
@@ -131,14 +155,28 @@ async def check_messages() -> dict:
         data = resp.json()
 
     messages = data.get("messages", [])
+
+    # Auto-filter: only count messages for this project
+    if PROJECT:
+        filtered = []
+        for msg in messages:
+            msg_to = msg.get("to")
+            msg_project = msg.get("project")
+            if msg_to == IDENTITY:
+                filtered.append(msg)
+            elif msg_to is None and (msg_project is None or msg_project == PROJECT):
+                filtered.append(msg)
+        messages = filtered
+
     if not messages:
-        return {"unread_count": 0, "latest_from": None, "latest_timestamp": None}
+        return {"unread_count": 0, "latest_from": None, "latest_timestamp": None, "project_filter": PROJECT or "all"}
 
     latest = messages[0]  # already sorted most-recent-first by Worker
     return {
         "unread_count": len(messages),
         "latest_from": latest["from"],
         "latest_timestamp": latest["timestamp"],
+        "project_filter": PROJECT or "all",
     }
 
 

@@ -71,7 +71,7 @@ export default {
 
 async function handleSend(request, env) {
   const body = await request.json();
-  const { content, from, tags, project } = body;
+  const { content, from, tags, project, to } = body;
 
   if (!content || !from) {
     return json({ error: "content and from are required" }, 400);
@@ -80,14 +80,17 @@ async function handleSend(request, env) {
   const id = crypto.randomUUID();
   const timestamp = new Date().toISOString();
 
-  const message = { id, from, project: project || null, timestamp, content, tags: tags || [], read: false };
+  const message = {
+    id, from, to: to || null, project: project || null,
+    timestamp, content, tags: tags || [], read: false,
+  };
 
   // Store the message
   await env.MESSAGES.put(`msg:${id}`, JSON.stringify(message));
 
   // Update index
   const index = await getIndex(env);
-  index.push({ id, timestamp, from, project: project || null, read: false });
+  index.push({ id, timestamp, from, to: to || null, project: project || null, read: false });
   await env.MESSAGES.put("index", JSON.stringify(index));
 
   return json({ id, timestamp, status: "sent" }, 201);
