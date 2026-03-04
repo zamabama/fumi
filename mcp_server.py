@@ -43,7 +43,10 @@ mcp = FastMCP(
         "When sending messages: always include tags for the target product/area "
         "(e.g. tags=['saku', 'wp016']) so recipients can filter. "
         "Use the 'to' param to target a specific machine/project (e.g. to='mac/cheetos').\n"
-        "DO NOT read or act on messages clearly intended for a different product or agent."
+        "DO NOT read or act on messages clearly intended for a different product or agent.\n"
+        "When you complete a task that was ASSIGNED to you via Photon (e.g. a work package, "
+        "a bug fix request, a specific ask), send a brief status message back with matching tags. "
+        "Don't reply to one-way informational messages — only respond when work was requested and completed."
     ),
 )
 
