@@ -35,9 +35,15 @@ if not API_KEY:
 mcp = FastMCP(
     name="photon",
     instructions=(
-        "Photon — message bridge between Mac and PC Claude Code instances. "
-        "Use check_messages at the start of each session to see if there are "
-        "pending messages from the other machine."
+        "Photon — message bridge between Claude Code instances across machines and projects.\n\n"
+        "At session start: call check_messages to see if anything is waiting for you.\n"
+        "When reading messages: use read_messages with tag= to filter for YOUR work area. "
+        "For example, if you're working on Saku, filter tag='saku'. If Yomi, tag='yomi'. "
+        "Only read messages relevant to what you're doing — ignore messages for other products/agents.\n"
+        "When sending messages: always include tags for the target product/area "
+        "(e.g. tags=['saku', 'wp016']) so recipients can filter. "
+        "Use the 'to' param to target a specific machine/project (e.g. to='mac/cheetos').\n"
+        "DO NOT read or act on messages clearly intended for a different product or agent."
     ),
 )
 
