@@ -120,11 +120,20 @@ Once configured, Claude Code gets these tools:
 
 | Tool | Description |
 |------|-------------|
-| `check_messages` | Quick unread count — call at session start |
-| `send_message` | Send a message with optional tags for categorization |
-| `read_messages` | Read messages with filters (unread, sender, project, tag, limit) |
-| `mark_read` | Mark a specific message as read by ID |
-| `clear_messages` | Delete all messages (requires `confirm=true` safety check) |
+| `check_messages` | Quick check for **fresh** unread (default last 10 min). Reports older backlog separately. |
+| `read_messages` | Read messages, auto-filtered to your identity. Defaults to fresh unread + auto-marks read. |
+| `send_message` | Send a message with optional tags. Refuses cross-project sends without `target=`. |
+| `resolve_project` | Scan `~/dev` and `~/Documents` for sibling Photon projects. Call before any cross-project send. |
+| `mark_read` | Mark a specific message as read by ID. |
+| `clear_messages` | Delete all messages (requires `confirm=true` safety check). |
+
+### Recency-first reading
+
+`check_messages` and `read_messages` default to the last 10 minutes of unread mail. The reasoning: in practice, "check photon" almost always means *the message I just sent* — old "unread" backlog is noise, not signal. Older unread is reported as a separate `older_unread_count` field so it isn't confused with new mail. Pass `max_age_minutes=` or `since=` to look further back.
+
+### Cross-project sends
+
+If you send a message tagged with another project's name but forget `target=`, the server refuses the send (since the message would be silently scoped to your own project and the other agent would never see it). Call `resolve_project(hint='<project>')` first — it returns the correct composite identity to use as `target=`, and warns if the same identity is shared by multiple project directories (the "everyone is `mac/global`" trap).
 
 ### Example usage in conversation
 

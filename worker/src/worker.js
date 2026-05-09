@@ -103,6 +103,7 @@ async function handleList(url, env) {
   const projectFilter = url.searchParams.get("project");
   const limit = parseInt(url.searchParams.get("limit") || "50", 10);
   const since = url.searchParams.get("since");
+  const markRead = url.searchParams.get("mark_read") === "true";
 
   let index = await getIndex(env);
 
@@ -128,6 +129,30 @@ async function handleList(url, env) {
   // Tag filter requires full message body
   if (tagFilter) {
     results = results.filter((m) => m.tags && m.tags.includes(tagFilter));
+  }
+
+  // Batch mark-read: flip the returned messages to read=true in one pass.
+  // Done after tag filtering so we only mark messages the caller actually saw.
+  if (markRead && results.length > 0) {
+    const idsToMark = new Set(results.map((m) => m.id));
+    const writes = [];
+    for (const m of results) {
+      if (!m.read) {
+        m.read = true;
+        writes.push(env.MESSAGES.put(`msg:${m.id}`, JSON.stringify(m)));
+      }
+    }
+    // Update the index entries in one write
+    const fullIndex = await getIndex(env);
+    let indexDirty = false;
+    for (const entry of fullIndex) {
+      if (idsToMark.has(entry.id) && !entry.read) {
+        entry.read = true;
+        indexDirty = true;
+      }
+    }
+    if (indexDirty) writes.push(env.MESSAGES.put("index", JSON.stringify(fullIndex)));
+    await Promise.all(writes);
   }
 
   return json({ messages: results, count: results.length });
