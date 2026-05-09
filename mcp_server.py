@@ -41,8 +41,11 @@ mcp = FastMCP(
         "For example, if you're working on Saku, filter tag='saku'. If Yomi, tag='yomi'. "
         "Only read messages relevant to what you're doing — ignore messages for other products/agents.\n"
         "When sending messages: always include tags for the target product/area "
-        "(e.g. tags=['saku', 'wp016']) so recipients can filter. "
-        "Use the 'to' param to target a specific machine/project (e.g. to='mac/cheetos').\n"
+        "(e.g. tags=['saku', 'wp016']) so recipients can filter.\n"
+        "IMPORTANT — Cross-project messaging: Messages are filtered by project. If you're sending "
+        "to a DIFFERENT project (e.g. from autonomy to lexus, or from cheetos to autonomy), "
+        "you MUST use the 'target' param (e.g. target='mac/lexus'). Without 'target', your message carries "
+        "your project tag and will be invisible to agents in other projects.\n"
         "DO NOT read or act on messages clearly intended for a different product or agent.\n"
         "When you complete a task that was ASSIGNED to you via Photon (e.g. a work package, "
         "a bug fix request, a specific ask), send a brief status message back with matching tags. "
@@ -60,15 +63,15 @@ def _headers():
 
 @mcp.tool(
     name="send_message",
-    description="Send a message to another Claude Code instance. Use 'to' to target a specific machine/project (e.g. 'mac/cheetos').",
+    description="Send a message to another Claude Code instance. Use 'target' to route to a specific machine/project (e.g. 'mac/cheetos').",
 )
-async def send_message(content: str, tags: list[str] | None = None, to: str | None = None) -> dict:
+async def send_message(content: str, tags: list[str] | None = None, target: str | None = None) -> dict:
     """Send a message through the bridge.
 
     Args:
         content: The message text (handover notes, task direction, status updates, etc.)
         tags: Optional tags for categorization (e.g. ["vlt", "handover", "tracking"])
-        to: Target recipient (e.g. "mac/cheetos", "pc/autonomy"). Omit for broadcast.
+        target: Target recipient (e.g. "mac/cheetos", "pc/autonomy"). Omit for same-project broadcast.
     """
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -78,13 +81,24 @@ async def send_message(content: str, tags: list[str] | None = None, to: str | No
                 "content": content,
                 "from": IDENTITY,
                 "project": PROJECT or None,
-                "to": to or None,
+                "to": target or None,  # 'target' param → 'to' in wire format (FastMCP drops 'to' as param name)
                 "tags": tags or [],
             },
             timeout=10,
         )
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+
+    # Cross-project warning: if sender has a project and didn't specify target,
+    # the message will only be visible to agents in the SAME project.
+    if PROJECT and not target:
+        result["warning"] = (
+            f"No 'target' specified. This message is scoped to project '{PROJECT}' — "
+            f"agents in other projects will NOT see it. "
+            f"Use target='mac/<project>' or target='pc/<project>' for cross-project messaging."
+        )
+
+    return result
 
 
 @mcp.tool(
