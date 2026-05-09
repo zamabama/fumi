@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .env
 wrangler.local.toml
+.venv/
+.mcp.json
