@@ -48,10 +48,20 @@ export default {
         return await handleClearAll(env);
       }
 
+      // POST /presence — register / heartbeat this identity
+      if (path === "/presence" && method === "POST") {
+        return await handleRegister(request, env);
+      }
+
+      // GET /presence — list active identities for a project
+      if (path === "/presence" && method === "GET") {
+        return await handleListPresence(url, env);
+      }
+
       // POST /messages/:id/read — mark read
       const markReadMatch = path.match(/^\/messages\/([^/]+)\/read$/);
       if (markReadMatch && method === "POST") {
-        return await handleMarkRead(markReadMatch[1], env);
+        return await handleMarkRead(markReadMatch[1], env, url.searchParams.get("identity"));
       }
 
       // DELETE /messages/:id — delete one
@@ -82,7 +92,7 @@ async function handleSend(request, env) {
 
   const message = {
     id, from, to: to || null, project: project || null,
-    timestamp, content, tags: tags || [], read: false,
+    timestamp, content, tags: tags || [], readBy: [],
   };
 
   // Store the message
@@ -90,7 +100,7 @@ async function handleSend(request, env) {
 
   // Update index
   const index = await getIndex(env);
-  index.push({ id, timestamp, from, to: to || null, project: project || null, read: false });
+  index.push({ id, timestamp, from, to: to || null, project: project || null, readBy: [] });
   await env.MESSAGES.put("index", JSON.stringify(index));
 
   return json({ id, timestamp, status: "sent" }, 201);
@@ -104,11 +114,15 @@ async function handleList(url, env) {
   const limit = parseInt(url.searchParams.get("limit") || "50", 10);
   const since = url.searchParams.get("since");
   const markRead = url.searchParams.get("mark_read") === "true";
+  // Read state is per-recipient. `identity` is the caller's full identity
+  // (e.g. "mac/primogen#website"). Unread = this identity isn't in readBy yet,
+  // so reading as #website never clears #crypto's copy.
+  const identity = url.searchParams.get("identity");
 
   let index = await getIndex(env);
 
   // Filter index
-  if (unreadOnly) index = index.filter((e) => !e.read);
+  if (unreadOnly) index = index.filter((e) => !isReadBy(e, identity));
   if (fromFilter) index = index.filter((e) => e.from === fromFilter);
   if (projectFilter) index = index.filter((e) => e.project === projectFilter);
   if (since) index = index.filter((e) => e.timestamp > since);
@@ -131,24 +145,32 @@ async function handleList(url, env) {
     results = results.filter((m) => m.tags && m.tags.includes(tagFilter));
   }
 
-  // Batch mark-read: flip the returned messages to read=true in one pass.
-  // Done after tag filtering so we only mark messages the caller actually saw.
-  if (markRead && results.length > 0) {
+  // Batch mark-read for THIS identity only: add `identity` to each returned
+  // message's readBy. Done after tag filtering so we only mark messages the
+  // caller actually saw. Without an identity (legacy/debug caller) we skip —
+  // there is no single recipient to attribute the read to.
+  if (markRead && identity && results.length > 0) {
     const idsToMark = new Set(results.map((m) => m.id));
     const writes = [];
     for (const m of results) {
-      if (!m.read) {
-        m.read = true;
+      const readBy = ensureReadBy(m);
+      if (!readBy.includes(identity)) {
+        readBy.push(identity);
+        m.readBy = readBy;
         writes.push(env.MESSAGES.put(`msg:${m.id}`, JSON.stringify(m)));
       }
     }
-    // Update the index entries in one write
+    // Mirror into the index entries (used for the fast unread filter above).
     const fullIndex = await getIndex(env);
     let indexDirty = false;
     for (const entry of fullIndex) {
-      if (idsToMark.has(entry.id) && !entry.read) {
-        entry.read = true;
-        indexDirty = true;
+      if (idsToMark.has(entry.id)) {
+        const readBy = ensureReadBy(entry);
+        if (!readBy.includes(identity)) {
+          readBy.push(identity);
+          entry.readBy = readBy;
+          indexDirty = true;
+        }
       }
     }
     if (indexDirty) writes.push(env.MESSAGES.put("index", JSON.stringify(fullIndex)));
@@ -158,23 +180,23 @@ async function handleList(url, env) {
   return json({ messages: results, count: results.length });
 }
 
-async function handleMarkRead(id, env) {
+async function handleMarkRead(id, env, identity) {
   const raw = await env.MESSAGES.get(`msg:${id}`);
   if (!raw) return json({ error: "Message not found" }, 404);
 
   const message = JSON.parse(raw);
-  message.read = true;
+  addReader(message, identity);
   await env.MESSAGES.put(`msg:${id}`, JSON.stringify(message));
 
-  // Update index
+  // Mirror into the index
   const index = await getIndex(env);
   const entry = index.find((e) => e.id === id);
   if (entry) {
-    entry.read = true;
+    addReader(entry, identity);
     await env.MESSAGES.put("index", JSON.stringify(index));
   }
 
-  return json({ id, status: "marked_read" });
+  return json({ id, status: "marked_read", identity: identity || null });
 }
 
 async function handleDelete(id, env) {
@@ -195,11 +217,132 @@ async function handleClearAll(env) {
   return json({ status: "cleared", count: index.length });
 }
 
+// --- Presence / roster ---
+//
+// Each agent registers its identity (and refreshes it on activity). Records are
+// kept in a per-project map and pruned once they go stale, so list_identities
+// shows only the agents currently working a project. A per-agent `token`
+// distinguishes "me refreshing" from "a different agent claimed my label".
+
+const PRESENCE_TTL_MS = 15 * 60 * 1000;
+
+function nowMs() {
+  return Date.now();
+}
+
+function presenceKey(project) {
+  return `presence:${project || "_none"}`;
+}
+
+async function getPresence(env, project) {
+  const raw = await env.MESSAGES.get(presenceKey(project));
+  return raw ? JSON.parse(raw) : {};
+}
+
+function pruneStale(map, now) {
+  for (const [k, v] of Object.entries(map)) {
+    if (now - (v.last_seen || 0) >= PRESENCE_TTL_MS) delete map[k];
+  }
+}
+
+async function handleRegister(request, env) {
+  const body = await request.json();
+  const { project, identity, workstream, description, token } = body;
+  if (!identity) return json({ error: "identity is required" }, 400);
+
+  const now = nowMs();
+  const map = await getPresence(env, project);
+  const existing = map[identity];
+
+  // Collision: a #workstream sub-identity held by a DIFFERENT, still-live agent.
+  // Don't steal the slot — report it so the newcomer picks another workstream.
+  // Base identities (no '#') are intentionally shareable (legacy single mailbox),
+  // so they never collide.
+  if (
+    identity.includes("#") &&
+    existing && existing.token && token && existing.token !== token &&
+    now - (existing.last_seen || 0) < PRESENCE_TTL_MS
+  ) {
+    return json({
+      status: "collision",
+      identity,
+      collision: {
+        held_by_other: true,
+        last_seen: new Date(existing.last_seen).toISOString(),
+        description: existing.description || null,
+      },
+    }, 409);
+  }
+
+  map[identity] = {
+    identity,
+    workstream: workstream || null,
+    description: description || null,
+    token: token || null,
+    last_seen: now,
+  };
+  pruneStale(map, now);
+
+  await env.MESSAGES.put(presenceKey(project), JSON.stringify(map));
+  return json({ status: "registered", identity });
+}
+
+async function handleListPresence(url, env) {
+  const project = url.searchParams.get("project");
+  const now = nowMs();
+  const map = await getPresence(env, project);
+
+  const identities = Object.values(map)
+    .filter((v) => now - (v.last_seen || 0) < PRESENCE_TTL_MS)
+    .map((v) => ({
+      identity: v.identity,
+      workstream: v.workstream,
+      description: v.description,
+      last_seen: new Date(v.last_seen).toISOString(),
+      seconds_ago: Math.round((now - v.last_seen) / 1000),
+    }))
+    .sort((a, b) => a.seconds_ago - b.seconds_ago);
+
+  return json({ project: project || null, count: identities.length, identities });
+}
+
 // --- Helpers ---
 
 async function getIndex(env) {
   const raw = await env.MESSAGES.get("index");
   return raw ? JSON.parse(raw) : [];
+}
+
+// --- Per-recipient read state ---
+//
+// Each message/index entry carries `readBy`: the list of identities that have
+// read it. "*" is a wildcard meaning read-by-everyone, used to migrate legacy
+// messages that only had a global `read: true` boolean.
+
+const READ_ALL = "*";
+
+// Return the entry's readBy array, migrating a legacy `read` boolean on the fly.
+// A legacy read:true becomes ["*"] (read by all); read:false/absent becomes [].
+function ensureReadBy(obj) {
+  if (Array.isArray(obj.readBy)) return obj.readBy;
+  return obj.read === true ? [READ_ALL] : [];
+}
+
+// Has this identity already read the entry? With no identity (legacy/debug
+// caller) fall back to "read by anyone", preserving the old global semantics.
+function isReadBy(entry, identity) {
+  const readBy = ensureReadBy(entry);
+  if (!identity) return readBy.length > 0;
+  return readBy.includes(READ_ALL) || readBy.includes(identity);
+}
+
+// Record that `identity` has read the entry (mutates in place). With no
+// identity, mark it read-by-all so an old client still clears it for everyone.
+function addReader(entry, identity) {
+  const readBy = ensureReadBy(entry);
+  const marker = identity || READ_ALL;
+  if (!readBy.includes(marker)) readBy.push(marker);
+  entry.readBy = readBy;
 }
 
 function json(data, status = 200) {

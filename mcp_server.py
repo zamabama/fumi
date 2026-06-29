@@ -13,6 +13,8 @@ Usage (stdio, via .mcp.json):
 
 import json
 import os
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,8 +28,38 @@ API_KEY = os.environ.get("BRIDGE_API_KEY", "")
 MACHINE_ID = os.environ.get("BRIDGE_MACHINE_ID", "unknown")
 PROJECT = os.environ.get("BRIDGE_PROJECT", "") or None
 
-# Composite identity: "mac/cheetos", "pc/autonomy", etc.
-IDENTITY = f"{MACHINE_ID}/{PROJECT}" if PROJECT else MACHINE_ID
+# Base identity for this project: "mac/cheetos", "pc/autonomy", etc.
+BASE_IDENTITY = f"{MACHINE_ID}/{PROJECT}" if PROJECT else MACHINE_ID
+
+# Optional workstream sub-identity, e.g. "website" → "mac/primogen#website".
+# This is what lets several agents open at the SAME project root keep their own
+# independent read state. Seeded from PHOTON_WORKSTREAM, but overridable at
+# runtime via set_identity() — agents that share one .mcp.json also share its
+# env, so the sub-identity has to be settable per-agent, in-process.
+_workstream = os.environ.get("PHOTON_WORKSTREAM", "").strip() or None
+
+# Short human-readable note about what this agent is doing (shown in the roster).
+_description = os.environ.get("PHOTON_DESCRIPTION", "").strip() or None
+
+# Stable per-process token. Each agent/chat gets its own MCP subprocess, so this
+# uniquely identifies THIS agent — it's how the roster tells "me refreshing" apart
+# from "a different agent tried to claim my workstream label".
+AGENT_TOKEN = uuid.uuid4().hex
+
+# Throttle for best-effort presence heartbeats (seconds). Keeps KV writes bounded
+# even with many agents reading frequently.
+_HEARTBEAT_INTERVAL_S = 60
+_last_heartbeat = 0.0
+
+
+def base_identity() -> str:
+    """The project-level identity, without any workstream suffix."""
+    return BASE_IDENTITY
+
+
+def current_identity() -> str:
+    """This agent's full identity, including its workstream suffix if set."""
+    return f"{BASE_IDENTITY}#{_workstream}" if _workstream else BASE_IDENTITY
 
 if not WORKER_URL:
     raise RuntimeError("BRIDGE_WORKER_URL environment variable is required")
@@ -75,6 +107,20 @@ mcp = FastMCP(
         "If you are talking to a specific agent in another project, target= is required — "
         "the server will reject sends that look cross-project but have no target.\n"
         "\n"
+        "## Multiple agents at the same project root (workstreams + roster)\n"
+        "When several agents/chats are open on the SAME project and each needs to receive the "
+        "same broadcasts independently, claim a workstream sub-identity at session start:\n"
+        "  1. Call list_identities() to see who's already active and which labels are taken.\n"
+        "  2. Pick a short label that matches YOUR task and isn't taken (e.g. 'website', "
+        "'crypto', 'ops'), then call set_identity('<label>', description='<what you're doing>'). "
+        "If the label is already held the call is refused — pick another. Only ask the user if "
+        "it's genuinely ambiguous.\n"
+        "Each workstream has its OWN read cursor, so one agent reading a message does NOT mark it "
+        "read for the others. To message a specific lane, call list_identities() to find it and "
+        "send with target='mac/<project>#<workstream>' (works cross-project too: "
+        "list_identities(project='X')). A lone agent doesn't need any of this — with no workstream "
+        "you get the normal single project mailbox, exactly as before.\n"
+        "\n"
         "## Replying\n"
         "When you complete a task that was ASSIGNED to you via Photon (a work package, "
         "a bug fix request, a specific ask), send a brief status message back with matching tags. "
@@ -91,22 +137,26 @@ def _headers():
 
 
 def _visible_to_me(msg: dict) -> bool:
-    """Single source of truth for 'is this message for me?'.
+    """Single source of truth for 'is this message addressed to me?'.
 
-    Visibility rules:
-      - Explicitly addressed to my IDENTITY → yes
-      - Broadcast (to=None) and message's project matches mine → yes
-      - Broadcast with project=None → only visible to agents that also have no PROJECT
-      - Anything else → no
+    This is *visibility* only — whether the message is meant for me. Whether
+    I've already read it is tracked separately, per-identity, by the Worker.
+
+    Rules:
+      - Addressed to my exact identity (including #workstream) → yes
+      - Addressed to my project's base identity (e.g. a cross-project send to
+        'mac/primogen') → visible to every agent in the project, including each
+        workstream; each then reads it on its own independent cursor
+      - Addressed to a different identity / workstream → no
+      - Broadcast (to=None): project-scoped as before — every agent in the
+        project sees it; a project=None broadcast only reaches no-project agents
     """
     msg_to = msg.get("to")
     msg_project = msg.get("project")
 
-    if msg_to == IDENTITY:
-        return True
     if msg_to is not None:
-        # Addressed to someone else
-        return False
+        return msg_to == current_identity() or msg_to == base_identity()
+
     # to is None — it's a broadcast
     if msg_project is None and PROJECT is None:
         return True
@@ -119,6 +169,45 @@ def _default_since_iso(max_age_minutes: int) -> str:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
     # Worker compares timestamps lexicographically as ISO strings — keep the same format.
     return cutoff.isoformat().replace("+00:00", "Z")
+
+
+async def _register_presence() -> dict:
+    """Register/refresh this agent's identity in the project roster (best-effort).
+
+    Returns the Worker's response dict. On a label collision the Worker replies
+    with status='collision' (HTTP 409) instead of stealing the slot. Never raises:
+    presence is auxiliary and must not break messaging.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{WORKER_URL}/presence",
+                headers=_headers(),
+                json={
+                    "project": PROJECT,
+                    "identity": current_identity(),
+                    "workstream": _workstream,
+                    "description": _description,
+                    "token": AGENT_TOKEN,
+                },
+                timeout=8,
+            )
+        if resp.status_code == 409:
+            return resp.json()
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:  # noqa: BLE001 — presence is best-effort
+        return {"status": "error", "error": str(exc)}
+
+
+async def _heartbeat() -> None:
+    """Throttled, best-effort presence refresh, called on normal activity."""
+    global _last_heartbeat
+    now = time.time()
+    if now - _last_heartbeat < _HEARTBEAT_INTERVAL_S:
+        return
+    _last_heartbeat = now
+    await _register_presence()
 
 
 def _find_photon_projects() -> list[dict]:
@@ -206,6 +295,7 @@ async def send_message(content: str, tags: list[str] | None = None, target: str 
         tags: Optional tags for categorization (e.g. ["vlt", "handover", "tracking"])
         target: Target recipient (e.g. "mac/cheetos", "pc/autonomy"). Omit for same-project broadcast.
     """
+    await _heartbeat()
     tags = tags or []
 
     # Cross-project safety: if any tag looks like a known project name OTHER than ours,
@@ -249,7 +339,7 @@ async def send_message(content: str, tags: list[str] | None = None, target: str 
             headers=_headers(),
             json={
                 "content": content,
-                "from": IDENTITY,
+                "from": current_identity(),
                 "project": PROJECT,
                 "to": target or None,  # 'target' param → 'to' in wire format (FastMCP drops 'to' as a param name)
                 "tags": tags,
@@ -299,6 +389,7 @@ async def read_messages(
         since: ISO timestamp; only return messages newer than this. Overrides max_age_minutes.
         keep_unread: Set True to NOT auto-mark fetched messages as read
     """
+    await _heartbeat()
     # Recency: when checking unread, default to fresh-only. The whole point of "unread"
     # in practice is "did anything just arrive," not "give me 6 months of backlog."
     effective_since = since
@@ -308,7 +399,7 @@ async def read_messages(
         elif unread_only:
             effective_since = _default_since_iso(DEFAULT_FRESHNESS_MINUTES)
 
-    params: dict[str, str] = {"limit": str(limit)}
+    params: dict[str, str] = {"limit": str(limit), "identity": current_identity()}
     if unread_only:
         params["unread"] = "true"
     if from_machine:
@@ -317,7 +408,8 @@ async def read_messages(
         params["tag"] = tag
     if effective_since:
         params["since"] = effective_since
-    # Auto-mark on the wire so two agents racing don't both grab it.
+    # Auto-mark on the wire, scoped to my identity: marking read as
+    # 'mac/x#website' does NOT clear the copy for 'mac/x#crypto'.
     if unread_only and not keep_unread:
         params["mark_read"] = "true"
 
@@ -342,7 +434,7 @@ async def read_messages(
     data["messages"] = visible
     data["count"] = len(visible)
     data["filtered_out"] = raw_count - len(visible)
-    data["identity"] = IDENTITY
+    data["identity"] = current_identity()
     if effective_since:
         data["since"] = effective_since
         data["since_note"] = (
@@ -367,6 +459,7 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
     Args:
         max_age_minutes: How recent counts as 'fresh' (default 10).
     """
+    await _heartbeat()
     fresh_since = _default_since_iso(max_age_minutes)
 
     async with httpx.AsyncClient() as client:
@@ -374,7 +467,7 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
         resp = await client.get(
             f"{WORKER_URL}/messages",
             headers=_headers(),
-            params={"unread": "true", "limit": "200"},
+            params={"unread": "true", "limit": "200", "identity": current_identity()},
             timeout=10,
         )
         resp.raise_for_status()
@@ -401,7 +494,7 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
         "fresh_window_minutes": max_age_minutes,
         "fresh_since": fresh_since,
         "latest_fresh": latest_info,
-        "identity": IDENTITY,
+        "identity": current_identity(),
     }
     if not fresh and older:
         result["note"] = (
@@ -426,10 +519,155 @@ async def mark_read(message_id: str) -> dict:
         resp = await client.post(
             f"{WORKER_URL}/messages/{message_id}/read",
             headers=_headers(),
+            params={"identity": current_identity()},
             timeout=10,
         )
         resp.raise_for_status()
         return resp.json()
+
+
+@mcp.tool(
+    name="set_identity",
+    description=(
+        "Declare this agent's workstream sub-identity (e.g. 'website', 'crypto', 'ops') so it "
+        "gets its OWN independent read state AND shows up in the project roster. Call this once at "
+        "session start when several agents are open on the SAME project root. Best practice: call "
+        "list_identities() first, pick a label that fits your task and isn't already taken, then "
+        "claim it here with a short description. If the label is already held by another live "
+        "agent the call is refused so you can pick another. A single agent / cross-project "
+        "messaging does NOT need this. Pass workstream='' to clear and use the plain project mailbox."
+    ),
+)
+async def set_identity(workstream: str, description: str = "") -> dict:
+    """Set (or clear) this session's workstream sub-identity and register it.
+
+    State lives in this MCP server process, which is per-agent, so two agents at
+    the same project root that call set_identity with different workstreams get
+    fully independent read cursors.
+
+    Args:
+        workstream: Short label for this agent's lane (e.g. "website"). Must not
+            contain '/' or '#'. Pass "" to clear and use the base project mailbox.
+        description: Optional short note shown in the roster (e.g. "landing redesign").
+    """
+    global _workstream, _description, _last_heartbeat
+    ws = (workstream or "").strip()
+    if ws and ("/" in ws or "#" in ws):
+        return {
+            "error": "invalid_workstream",
+            "message": "Workstream must not contain '/' or '#'. Use a short label like 'website'.",
+        }
+
+    prev_ws, prev_desc = _workstream, _description
+    _workstream = ws or None
+    _description = (description or "").strip() or None
+
+    # Claim the label in the roster. If a different live agent already holds this
+    # workstream, the Worker refuses — revert and tell the caller to pick another.
+    reg = await _register_presence()
+    if reg.get("status") == "collision":
+        _workstream, _description = prev_ws, prev_desc
+        held = reg.get("collision", {})
+        held_desc = f" ({held['description']})" if held.get("description") else ""
+        return {
+            "error": "workstream_taken",
+            "message": (
+                f"Workstream '{ws}' is already held by another active agent on project "
+                f"'{PROJECT}'{held_desc}, last seen {held.get('last_seen')}. Pick a different "
+                "label (call list_identities to see what's taken) or ask the user."
+            ),
+            "still_using": current_identity(),
+        }
+    _last_heartbeat = time.time()  # the register above counts as a heartbeat
+
+    if _workstream:
+        note = (
+            f"This session now reads and sends as '{current_identity()}'. Its read cursor is "
+            f"independent from any other workstream at project '{PROJECT}', and it's now listed "
+            "in the roster (list_identities)."
+        )
+    else:
+        note = f"Workstream cleared. Reading and sending as the base identity '{base_identity()}'."
+    return {
+        "identity": current_identity(),
+        "base_identity": base_identity(),
+        "workstream": _workstream,
+        "description": _description,
+        "note": note,
+    }
+
+
+@mcp.tool(
+    name="list_identities",
+    description=(
+        "List the agents currently active on a project and the workstream sub-identities they've "
+        "claimed (the roster). Call this BEFORE set_identity to pick a free label, and before "
+        "sending to a specific lane to find the right target (e.g. 'mac/primogen#website'). "
+        "Defaults to your own project; pass project= to inspect another project's roster."
+    ),
+)
+async def list_identities(project: str | None = None) -> dict:
+    """List active identities (the roster) for a project.
+
+    Args:
+        project: Optional project name/hint. Omit for your own project. If given,
+            it's resolved against the Photon projects known on this machine.
+    """
+    target_project = PROJECT
+    resolution = None
+
+    if project:
+        candidates = _find_photon_projects()
+        scored = sorted(
+            ({**c, "score": _score_match(project, c)} for c in candidates),
+            key=lambda x: -x["score"],
+        )
+        scored = [c for c in scored if c["score"] > 0]
+        if not scored:
+            return {
+                "error": "project_not_found",
+                "message": (
+                    f"No Photon project matching '{project}' found. Ask the user to clarify, "
+                    "or call resolve_project for candidates."
+                ),
+            }
+        top = scored[0]
+        confident = (
+            len(scored) == 1
+            or top["score"] >= 100
+            or (len(scored) > 1 and top["score"] - scored[1]["score"] >= 30)
+        )
+        if not confident:
+            return {
+                "error": "ambiguous_project",
+                "message": "Multiple projects match that hint. Ask the user which one before listing.",
+                "candidates": scored,
+            }
+        target_project = top["project"]
+        resolution = {
+            "hint": project,
+            "resolved_project": target_project,
+            "directory": top["directory_name"],
+        }
+
+    params: dict[str, str] = {}
+    if target_project:
+        params["project"] = target_project
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{WORKER_URL}/presence",
+            headers=_headers(),
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    data["you_are"] = current_identity()
+    if resolution:
+        data["resolution"] = resolution
+    return data
 
 
 @mcp.tool(
