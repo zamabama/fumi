@@ -41,6 +41,15 @@ A usability gap surfaced in real use: a message sent to the *wrong* lane (`to ma
 
 Internals: `_visible_to_me` generalised to `_visible_to(msg, identity)`; added `_parse_identity` and `_fetch_roster`.
 
+## Follow-up 2 — default isolation (regression fix)
+
+The first follow-up over-corrected: surfacing `other_lanes_waiting` in `check_messages` and nudging agents to retrieve other lanes' mail made agents snoop — and in one case auto-start work that wasn't theirs. Corrected to **strict default isolation**:
+
+- **Server-side visibility (Worker, deployed).** `GET /messages` with an `identity` now only returns mail addressed to that identity (or its project's broadcasts); `all_lanes=true` opts out. Enforced on the Worker, so it takes effect for already-running agents with no reload, and misdirected mail is never even transmitted to the wrong agent.
+- **`check_messages` returns only your mail** — `other_lanes_waiting` removed entirely.
+- **Cross-lane reads are user-directed only.** `read_messages(as_recipient=…)` (one lane) and the new `read_messages(include_all_lanes=true)` (search all lanes, read-only) exist for "the user told me to look" / "a message should be here but isn't." Server instructions now say emphatically: stay in your lane; act only on what's addressed to you.
+- The send-time dead-lane guard is unchanged (still the best prevention).
+
 ## Migration
 
 - **No data migration needed.** Legacy messages with `read: true` are treated as read-by-everyone (`readBy` wildcard `*`) so nothing resurfaces; `read: false` stays unread. Old clients that call without an `identity` fall back to the previous global semantics.

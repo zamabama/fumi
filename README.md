@@ -121,8 +121,8 @@ Once configured, Claude Code gets these tools:
 
 | Tool | Description |
 |------|-------------|
-| `check_messages` | Quick check for **fresh** unread (default last 10 min). Reports older backlog and `other_lanes_waiting` (possibly mis-targeted mail) separately. |
-| `read_messages` | Read messages, auto-filtered to your identity. Defaults to fresh unread + auto-marks read. `as_recipient=` reads another lane's mail without switching identity. |
+| `check_messages` | Quick check for **fresh** unread (default last 10 min). Only ever returns mail addressed to you. Reports older backlog separately. |
+| `read_messages` | Read messages addressed to you. Defaults to fresh unread + auto-marks read. `as_recipient=` / `include_all_lanes=` look beyond your lane **only when the user directs you to**. |
 | `send_message` | Send a message with optional tags. Refuses cross-project sends without `target=`, and holds sends to a `#workstream` no live agent is using (`allow_unregistered=true` to force). |
 | `set_identity` | Claim a workstream sub-identity (e.g. `"website"`) so this agent gets its own independent read cursor and a roster entry. |
 | `list_identities` | List the agents/workstreams currently active on a project (the roster). Call before `set_identity` or before targeting a specific lane. |
@@ -156,13 +156,19 @@ set_identity("website", description="landing redesign")   # claim a free lane
 - **Targeting a lane** — `send_message(target="mac/primogen#website")` reaches just that lane. Cross-project too: `list_identities(project="cocobun")` then target the identity it returns.
 - **Backward compatible** — no workstream means the plain project mailbox, exactly as before.
 
-### Mis-addressed mail
+### Stay in your lane (default isolation)
 
-If a message is sent to the wrong lane (`mac/primogen#crypto` when it was meant for `#website`), it's only "addressed to" `#crypto` — so the other lanes don't get it in their normal reads. Three things keep it from getting stuck:
+**An agent only ever receives mail addressed to it** — its own identity, or its project's broadcasts. This is enforced **server-side**: the Worker never transmits another lane's message to you, so an agent can't read, surface, or act on work meant for a different workstream. `check_messages` and `read_messages` show *your* mail and nothing else. This keeps a master → N-workers fan-out clean: each worker sees only its own task.
 
-1. **Prevent** — `send_message` to a `#workstream` no live agent is using is **held, not sent**, and returns the current roster so you can pick the right lane. Override with `allow_unregistered=true`.
-2. **Discover** — `check_messages` reports `other_lanes_waiting`, e.g. `{"mac/primogen#crypto": 1}`, for mail addressed to a sibling lane that the intended lane hasn't read yet. So "check photon" surfaces a likely mis-target instead of "nothing fresh."
-3. **Retrieve** — `read_messages(as_recipient="mac/primogen#crypto")` reads that lane's mail in one call **without changing your own identity** — no `set_identity`-there-and-back. Defaults to consuming that lane's copy; pass `keep_unread=true` to peek only.
+> To give one specific agent a task, **target it** — `send_message(target="mac/primogen#website")`. Don't broadcast per-agent tasks; a broadcast is seen by every lane on purpose.
+
+### Looking beyond your lane (user-directed only)
+
+Sometimes you *do* need to reach across lanes — e.g. a message was mis-sent to the wrong one. These are deliberate, user-directed escape hatches; agents should not use them on their own initiative:
+
+- **Prevent it up front** — `send_message` to a `#workstream` no live agent is using is **held, not sent**, and returns the roster so you can pick the right lane. Override with `allow_unregistered=true`.
+- **Read one specific lane** — `read_messages(as_recipient="mac/primogen#crypto")` reads that lane's mail **without changing your own identity** (no `set_identity`-there-and-back). Consumes that lane's copy by default; `keep_unread=true` to peek.
+- **Search every lane** — `read_messages(include_all_lanes=true)` returns all lanes in your project, read-only, for when "there should be a message for me but I can't find it." Check each message's `to` before acting.
 
 ### Example usage in conversation
 
@@ -195,7 +201,8 @@ All endpoints require `Authorization: Bearer <key>` header except `/health`.
 | Parameter | Description |
 |-----------|-------------|
 | `unread` | `"true"` to return only unread messages |
-| `identity` | Caller's identity — scopes `unread`/`mark_read` per recipient (so reading as one lane doesn't clear another's). Falls back to legacy global read state if omitted. |
+| `identity` | Caller's identity — scopes both **visibility** (only mail addressed to this identity or its project's broadcasts is returned) and `unread`/`mark_read` (per-recipient read state). Falls back to legacy global behaviour if omitted. |
+| `all_lanes` | `"true"` to bypass the visibility filter and return every lane's mail (for a user-directed cross-lane search). |
 | `mark_read` | `"true"` to mark the returned messages read for `identity` in the same call |
 | `from` | Filter by sender machine ID |
 | `project` | Filter by project name |

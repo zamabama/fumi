@@ -121,12 +121,19 @@ mcp = FastMCP(
         "list_identities(project='X')). A lone agent doesn't need any of this — with no workstream "
         "you get the normal single project mailbox, exactly as before.\n"
         "\n"
-        "## Mis-addressed mail\n"
-        "If the user expected a message that isn't showing up, it may have been sent to the wrong "
-        "lane. check_messages reports other_lanes_waiting for mail addressed to a different "
-        "workstream in your project; pick it up with read_messages(as_recipient='<that identity>') "
-        "WITHOUT changing your own identity — no set_identity-and-back dance. (Sends to a lane no "
-        "live agent is using are held by default to prevent this; force with allow_unregistered=true.)\n"
+        "## Stay in your lane (IMPORTANT)\n"
+        "You ONLY ever receive mail addressed to you (your identity, your project's broadcasts). "
+        "check_messages and read_messages never surface other agents' messages. Do NOT go looking "
+        "for, read, or act on mail meant for another workstream. Another lane's task is not yours — "
+        "act only on what is addressed to you. If you have no fresh mail, the answer is 'nothing for "
+        "me', not 'let me check what others got'.\n"
+        "Only when the USER explicitly tells you to look elsewhere:\n"
+        "  - read_messages(as_recipient='mac/<project>#<lane>') reads one specific other lane's mail "
+        "(e.g. 'grab the message I sent to crypto by mistake').\n"
+        "  - read_messages(include_all_lanes=true) searches every lane in your project, read-only "
+        "(e.g. 'I sent you something but you can't find it — look across all lanes').\n"
+        "(Senders: a message to a lane no live agent is using is held by default so it can't get "
+        "lost; force with allow_unregistered=true.)\n"
         "\n"
         "## Replying\n"
         "When you complete a task that was ASSIGNED to you via Photon (a work package, "
@@ -434,13 +441,13 @@ async def send_message(
 @mcp.tool(
     name="read_messages",
     description=(
-        "Read messages from the bridge, auto-filtered to your identity. "
-        "Defaults: only fresh unread (last 10 min) and auto-marks them read so the queue doesn't pile up. "
+        "Read messages addressed to YOU. Defaults: only fresh unread (last 10 min), auto-marked read. "
         "Pass max_age_minutes= or since= to look further back. "
-        "To pick up mail that was mis-addressed to a DIFFERENT lane in your project, pass "
-        "as_recipient='mac/<project>#<workstream>' — it reads on that lane's behalf WITHOUT "
-        "changing your own identity (no set_identity dance). Find the right lane via list_identities "
-        "or the other_lanes_waiting field from check_messages."
+        "You only ever see your own mail — do NOT try to read other lanes' messages unless the USER "
+        "explicitly directs you to. When the user does: as_recipient='mac/<project>#<lane>' reads one "
+        "specific other lane's mail (e.g. to pick up something mis-sent there); include_all_lanes=true "
+        "searches ALL lanes in your project read-only (use when the user says a message should exist "
+        "for you but you can't find it)."
     ),
 )
 async def read_messages(
@@ -453,6 +460,7 @@ async def read_messages(
     since: str | None = None,
     keep_unread: bool = False,
     as_recipient: str | None = None,
+    include_all_lanes: bool = False,
 ) -> dict:
     """Read messages, auto-filtered to this project's context.
 
@@ -461,18 +469,24 @@ async def read_messages(
         from_machine: Filter by sender (e.g. "mac", "pc", "mac/cheetos")
         tag: Filter by tag
         limit: Maximum number of messages to return (default 20)
-        all_projects: Set True to bypass identity filtering (for debugging)
+        all_projects: Set True to bypass all visibility filtering, every project (debugging)
         max_age_minutes: Only return messages newer than this many minutes (default 10 when unread_only=True; no default otherwise)
         since: ISO timestamp; only return messages newer than this. Overrides max_age_minutes.
         keep_unread: Set True to NOT auto-mark fetched messages as read
-        as_recipient: Read on behalf of another lane's identity (e.g. to retrieve mail
-            mis-addressed to "mac/<project>#crypto") WITHOUT changing your own identity.
+        as_recipient: USER-DIRECTED ONLY. Read on behalf of another lane's identity (e.g. to
+            retrieve mail mis-sent to "mac/<project>#crypto") WITHOUT changing your own identity.
             By default this consumes that lane's copy; pass keep_unread=True to peek only.
+        include_all_lanes: USER-DIRECTED ONLY. Search ALL lanes in your project (read-only, never
+            marks read) — for finding a message the user says should be here but isn't in your lane.
     """
     await _heartbeat()
-    # Identity to read/mark AS. Normally me; with as_recipient, another lane (used to
-    # pick up misdirected mail without the set_identity-there-and-back dance).
+    # Identity to read/mark AS. Normally me; with as_recipient, another lane (used,
+    # only when the user directs it, to pick up mail mis-sent to that lane).
     read_identity = as_recipient or current_identity()
+
+    # Cross-lane visibility opt-outs — both are explicit, user-directed escape hatches.
+    # include_all_lanes: every lane in MY project. all_projects: everything, everywhere.
+    bypass_visibility = include_all_lanes or all_projects
 
     # Recency: when checking unread, default to fresh-only. The whole point of "unread"
     # in practice is "did anything just arrive," not "give me 6 months of backlog."
@@ -492,9 +506,14 @@ async def read_messages(
         params["tag"] = tag
     if effective_since:
         params["since"] = effective_since
-    # Auto-mark on the wire, scoped to read_identity: marking read as
-    # 'mac/x#website' does NOT clear the copy for 'mac/x#crypto'.
-    if unread_only and not keep_unread:
+    if bypass_visibility:
+        params["all_lanes"] = "true"
+        # Keep an all-lanes search scoped to my own project unless explicitly all_projects.
+        if include_all_lanes and not all_projects and PROJECT:
+            params["project"] = PROJECT
+    # Auto-mark on the wire, scoped to read_identity. Never auto-mark when searching
+    # across lanes — that's a read-only look at others' mail, not mine to consume.
+    if unread_only and not keep_unread and not bypass_visibility:
         params["mark_read"] = "true"
 
     async with httpx.AsyncClient() as client:
@@ -510,7 +529,7 @@ async def read_messages(
     raw_messages = data.get("messages", [])
     raw_count = len(raw_messages)
 
-    if all_projects:
+    if bypass_visibility:
         visible = raw_messages
     else:
         visible = [m for m in raw_messages if _visible_to(m, read_identity)]
@@ -528,6 +547,12 @@ async def read_messages(
             + ("Their copy was left unread (peek)." if keep_unread
                else "Their copy was marked read (pass keep_unread=True to peek instead).")
         )
+    if include_all_lanes:
+        data["scope_note"] = (
+            "Showing ALL lanes in your project because you asked to search wide. These are NOT all "
+            "addressed to you — check each message's 'to' field before acting, and only act on the "
+            "one the user actually wants. Read-only: nothing was marked read."
+        )
     if effective_since:
         data["since"] = effective_since
         data["since_note"] = (
@@ -543,9 +568,8 @@ async def read_messages(
     description=(
         "Quick check — is anything fresh waiting for me? "
         "Defaults to the last 10 minutes (which matches the user saying 'check photon, I just sent it'). "
-        "Reports older_unread_count separately so you know if there's stale backlog without confusing it with new mail. "
-        "Also reports other_lanes_waiting — mail addressed to a different workstream in your project that may have "
-        "been mis-targeted; if the user expected a message that isn't here, that's where to look."
+        "Only ever returns mail addressed to YOU. Reports older_unread_count separately so you know if "
+        "there's stale backlog without confusing it with new mail."
     ),
 )
 async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> dict:
@@ -568,29 +592,11 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
         resp.raise_for_status()
         data = resp.json()
 
-    raw_unread = data.get("messages", [])
-    all_unread = [m for m in raw_unread if _visible_to_me(m)]
+    # The Worker only returns mail addressed to me (or my project's broadcasts), so
+    # this is just defence-in-depth — other lanes' messages never arrive here.
+    all_unread = [m for m in data.get("messages", []) if _visible_to_me(m)]
     fresh = [m for m in all_unread if m.get("timestamp", "") > fresh_since]
     older = [m for m in all_unread if m.get("timestamp", "") <= fresh_since]
-
-    # Misdirected-mail discovery: messages addressed to ANOTHER workstream in my
-    # project that the intended lane hasn't read yet. These are invisible to me by
-    # the normal rules, but I can surface a hint so they don't get stuck — the user
-    # can then grab one with read_messages(as_recipient=...). Skip messages the
-    # intended lane already handled (its identity, or '*', is in readBy).
-    my_base = base_identity()
-    other_lanes: dict[str, int] = {}
-    for m in raw_unread:
-        to = m.get("to")
-        if not to or to == current_identity():
-            continue
-        t_base, _t_project, t_ws = _parse_identity(to)
-        if t_base != my_base or t_ws is None:
-            continue  # only sibling #workstreams in my own project
-        read_by = m.get("readBy") or []
-        if to in read_by or "*" in read_by:
-            continue  # the intended lane already read it
-        other_lanes[to] = other_lanes.get(to, 0) + 1
 
     if fresh:
         latest = fresh[0]  # sorted most-recent-first by Worker
@@ -616,13 +622,6 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
             f"Nothing fresh in the last {max_age_minutes} min. "
             f"There are {len(older)} older unread message(s) but the user almost certainly "
             f"did NOT mean those — they're stale. Only surface them if explicitly asked."
-        )
-    if other_lanes:
-        result["other_lanes_waiting"] = other_lanes
-        result["other_lanes_note"] = (
-            "These messages are addressed to OTHER workstreams in your project and the intended "
-            "lane hasn't read them — possibly mis-targeted. If the user expected one here, grab it "
-            "with read_messages(as_recipient='<that identity>') — no need to change your identity."
         )
     return result
 

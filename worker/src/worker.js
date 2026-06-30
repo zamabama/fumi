@@ -118,10 +118,16 @@ async function handleList(url, env) {
   // (e.g. "mac/primogen#website"). Unread = this identity isn't in readBy yet,
   // so reading as #website never clears #crypto's copy.
   const identity = url.searchParams.get("identity");
+  // Visibility is enforced HERE, server-side: with an identity set, callers only
+  // ever receive mail addressed to them (or their project's broadcasts). Mail for
+  // a different lane is never transmitted, so an agent can't read or even see it.
+  // `all_lanes=true` opts out (explicit, user-directed "search everywhere").
+  const allLanes = url.searchParams.get("all_lanes") === "true";
 
   let index = await getIndex(env);
 
   // Filter index
+  if (identity && !allLanes) index = index.filter((e) => visibleTo(e, identity));
   if (unreadOnly) index = index.filter((e) => !isReadBy(e, identity));
   if (fromFilter) index = index.filter((e) => e.from === fromFilter);
   if (projectFilter) index = index.filter((e) => e.project === projectFilter);
@@ -343,6 +349,29 @@ function addReader(entry, identity) {
   const marker = identity || READ_ALL;
   if (!readBy.includes(marker)) readBy.push(marker);
   entry.readBy = readBy;
+}
+
+// --- Visibility ---
+//
+// Mirrors the client's _visible_to: a message is visible to an identity if it is
+// addressed to that exact identity, to that identity's project base (e.g. a
+// cross-project send to "mac/primogen" reaches every lane), or is a broadcast in
+// that identity's project. Enforced server-side so misdirected mail never leaks.
+
+function parseIdentity(identity) {
+  const base = identity.split("#")[0];
+  const project = base.includes("/") ? base.split("/").slice(1).join("/") : null;
+  return { base, project };
+}
+
+function visibleTo(entry, identity) {
+  const { base, project } = parseIdentity(identity);
+  const to = entry.to ?? null;
+  if (to !== null) return to === identity || to === base;
+  // broadcast (to === null): project-scoped
+  const proj = entry.project ?? null;
+  if (proj === null && project === null) return true;
+  return proj !== null && proj === project;
 }
 
 function json(data, status = 200) {
