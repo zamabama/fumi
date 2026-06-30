@@ -31,6 +31,16 @@ Several agents on one project:
 2. `set_identity("website", description="landing redesign")` — claim a free lane (auto-declared from your task; only ask the user if ambiguous).
 3. Send to a specific lane with `target="mac/<project>#<workstream>"` (find it via `list_identities`, cross-project too).
 
+## Follow-up — mis-addressed mail (MCP-only, no redeploy)
+
+A usability gap surfaced in real use: a message sent to the *wrong* lane (`to mac/primogen#crypto`) was invisible to every other lane, retrievable only by an agent temporarily impersonating that identity (`set_identity` there and back). Root cause: visibility conflated "addressed to" with "only visible to." Fixed at all three stages, entirely in `mcp_server.py` (the Worker already had the needed data):
+
+1. **Prevent — send-time dead-lane guard.** `send_message` to a `#workstream` target that isn't in the live roster is held (not sent) and returns the roster + same-project lane suggestions. Force with `allow_unregistered=true`.
+2. **Discover — `check_messages.other_lanes_waiting`.** Reports mail addressed to another workstream in your project that the intended lane hasn't read yet (so "check photon" surfaces a likely mis-target instead of "nothing fresh").
+3. **Retrieve — `read_messages(as_recipient='mac/<project>#<lane>')`.** Reads/handles another lane's mail in one call **without changing your own identity** (no impersonation dance). Defaults to consuming that lane's copy; `keep_unread=true` to peek.
+
+Internals: `_visible_to_me` generalised to `_visible_to(msg, identity)`; added `_parse_identity` and `_fetch_roster`.
+
 ## Migration
 
 - **No data migration needed.** Legacy messages with `read: true` are treated as read-by-everyone (`readBy` wildcard `*`) so nothing resurfaces; `read: false` stays unread. Old clients that call without an `identity` fall back to the previous global semantics.
@@ -39,12 +49,13 @@ Several agents on one project:
 
 ## Testing
 
-32 checks, all passing — run them with:
+51 checks, all passing — run them with:
 - `node /tmp/photon_worker_test.mjs` — per-recipient read state + legacy migration (9)
 - `node /tmp/photon_presence_test.mjs` — register / collision / roster / TTL prune (9)
 - `.venv/bin/python3 /tmp/photon_visibility_test.py` — identity resolution + visibility + set_identity (14)
+- `.venv/bin/python3 /tmp/photon_misdirect_test.py` — send guard / other_lanes_waiting / as_recipient retrieval (19)
 
-(The two Node suites import the real `worker.fetch` against an in-memory KV stub; no deploy needed to test.)
+(The two Node suites import the real `worker.fetch` against an in-memory KV stub; the Python suites use the pure helpers / a fake httpx layer. No deploy needed to test.)
 
 ## Files changed
 - `worker/src/worker.js` — readBy, identity-scoped list/mark, `/presence` register+list+TTL.

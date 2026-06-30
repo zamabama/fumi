@@ -121,6 +121,13 @@ mcp = FastMCP(
         "list_identities(project='X')). A lone agent doesn't need any of this — with no workstream "
         "you get the normal single project mailbox, exactly as before.\n"
         "\n"
+        "## Mis-addressed mail\n"
+        "If the user expected a message that isn't showing up, it may have been sent to the wrong "
+        "lane. check_messages reports other_lanes_waiting for mail addressed to a different "
+        "workstream in your project; pick it up with read_messages(as_recipient='<that identity>') "
+        "WITHOUT changing your own identity — no set_identity-and-back dance. (Sends to a lane no "
+        "live agent is using are held by default to prevent this; force with allow_unregistered=true.)\n"
+        "\n"
         "## Replying\n"
         "When you complete a task that was ASSIGNED to you via Photon (a work package, "
         "a bug fix request, a specific ask), send a brief status message back with matching tags. "
@@ -136,33 +143,51 @@ def _headers():
     }
 
 
-def _visible_to_me(msg: dict) -> bool:
-    """Single source of truth for 'is this message addressed to me?'.
+def _parse_identity(identity: str) -> tuple[str, str | None, str | None]:
+    """Split an identity into (base, project, workstream).
 
-    This is *visibility* only — whether the message is meant for me. Whether
-    I've already read it is tracked separately, per-identity, by the Worker.
+    "mac/primogen#website" → ("mac/primogen", "primogen", "website")
+    "mac/primogen"         → ("mac/primogen", "primogen", None)
+    "mac"                  → ("mac", None, None)
+    """
+    base, _, workstream = identity.partition("#")
+    workstream = workstream or None
+    project = base.split("/", 1)[1] if "/" in base else None
+    return base, project, workstream
+
+
+def _visible_to(msg: dict, identity: str) -> bool:
+    """Is this message addressed to (visible to) the given identity?
+
+    Visibility only — read/unread is tracked separately, per-identity, by the
+    Worker. Used both for 'me' and for reading on behalf of another lane.
 
     Rules:
-      - Addressed to my exact identity (including #workstream) → yes
-      - Addressed to my project's base identity (e.g. a cross-project send to
-        'mac/primogen') → visible to every agent in the project, including each
-        workstream; each then reads it on its own independent cursor
+      - Addressed to that exact identity (including #workstream) → yes
+      - Addressed to that identity's project base (e.g. a cross-project send to
+        'mac/primogen') → visible to every agent/workstream in the project
       - Addressed to a different identity / workstream → no
-      - Broadcast (to=None): project-scoped as before — every agent in the
-        project sees it; a project=None broadcast only reaches no-project agents
+      - Broadcast (to=None): project-scoped — every agent in the project sees it;
+        a project=None broadcast only reaches no-project agents
     """
+    base, project, _ws = _parse_identity(identity)
     msg_to = msg.get("to")
     msg_project = msg.get("project")
 
     if msg_to is not None:
-        return msg_to == current_identity() or msg_to == base_identity()
+        return msg_to == identity or msg_to == base
 
     # to is None — it's a broadcast
-    if msg_project is None and PROJECT is None:
+    if msg_project is None and project is None:
         return True
-    if msg_project is not None and msg_project == PROJECT:
+    if msg_project is not None and msg_project == project:
         return True
     return False
+
+
+def _visible_to_me(msg: dict) -> bool:
+    """Visibility for this session's own identity."""
+    return _visible_to(msg, current_identity())
 
 
 def _default_since_iso(max_age_minutes: int) -> str:
@@ -208,6 +233,19 @@ async def _heartbeat() -> None:
         return
     _last_heartbeat = now
     await _register_presence()
+
+
+async def _fetch_roster(project: str | None) -> list[dict]:
+    """Fetch the live identities for a project from the Worker's presence registry."""
+    params: dict[str, str] = {}
+    if project:
+        params["project"] = project
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{WORKER_URL}/presence", headers=_headers(), params=params, timeout=8
+        )
+        resp.raise_for_status()
+        return resp.json().get("identities", [])
 
 
 def _find_photon_projects() -> list[dict]:
@@ -287,13 +325,20 @@ def _score_match(hint: str, candidate: dict) -> int:
         "Use 'target' to route to a specific machine/project (e.g. 'mac/cheetos')."
     ),
 )
-async def send_message(content: str, tags: list[str] | None = None, target: str | None = None) -> dict:
+async def send_message(
+    content: str,
+    tags: list[str] | None = None,
+    target: str | None = None,
+    allow_unregistered: bool = False,
+) -> dict:
     """Send a message through the bridge.
 
     Args:
         content: The message text (handover notes, task direction, status updates, etc.)
         tags: Optional tags for categorization (e.g. ["vlt", "handover", "tracking"])
         target: Target recipient (e.g. "mac/cheetos", "pc/autonomy"). Omit for same-project broadcast.
+        allow_unregistered: Force-send to a #workstream target even if no live agent is
+            using it (bypasses the dead-lane guard). Default False.
     """
     await _heartbeat()
     tags = tags or []
@@ -333,6 +378,33 @@ async def send_message(content: str, tags: list[str] | None = None, target: str 
                     "hint_tag": tag,
                 }
 
+    # Dead-lane guard: a #workstream target that no live agent is using is almost
+    # always a typo or an idle lane — the message would sit unread and invisible to
+    # everyone else. Hold it and show the roster unless explicitly forced.
+    if target and "#" in target and not allow_unregistered:
+        _t_base, t_project, _t_ws = _parse_identity(target)
+        try:
+            roster = await _fetch_roster(t_project)
+        except Exception:
+            roster = []
+        live_ids = {r.get("identity") for r in roster}
+        if target not in live_ids:
+            same_base = sorted(
+                r["identity"] for r in roster
+                if r.get("identity", "").partition("#")[0] == _t_base
+            )
+            return {
+                "error": "target_workstream_not_live",
+                "message": (
+                    f"No live agent is using '{target}', so the message was NOT sent — it would "
+                    "sit unread and invisible to the other lanes. Pick a live lane below, or "
+                    "re-send with allow_unregistered=true to force it."
+                ),
+                "target": target,
+                "live_lanes_same_project": same_base or [r.get("identity") for r in roster],
+                "roster": roster,
+            }
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{WORKER_URL}/messages",
@@ -364,7 +436,11 @@ async def send_message(content: str, tags: list[str] | None = None, target: str 
     description=(
         "Read messages from the bridge, auto-filtered to your identity. "
         "Defaults: only fresh unread (last 10 min) and auto-marks them read so the queue doesn't pile up. "
-        "Pass max_age_minutes= or since= to look further back."
+        "Pass max_age_minutes= or since= to look further back. "
+        "To pick up mail that was mis-addressed to a DIFFERENT lane in your project, pass "
+        "as_recipient='mac/<project>#<workstream>' — it reads on that lane's behalf WITHOUT "
+        "changing your own identity (no set_identity dance). Find the right lane via list_identities "
+        "or the other_lanes_waiting field from check_messages."
     ),
 )
 async def read_messages(
@@ -376,6 +452,7 @@ async def read_messages(
     max_age_minutes: int | None = None,
     since: str | None = None,
     keep_unread: bool = False,
+    as_recipient: str | None = None,
 ) -> dict:
     """Read messages, auto-filtered to this project's context.
 
@@ -388,8 +465,15 @@ async def read_messages(
         max_age_minutes: Only return messages newer than this many minutes (default 10 when unread_only=True; no default otherwise)
         since: ISO timestamp; only return messages newer than this. Overrides max_age_minutes.
         keep_unread: Set True to NOT auto-mark fetched messages as read
+        as_recipient: Read on behalf of another lane's identity (e.g. to retrieve mail
+            mis-addressed to "mac/<project>#crypto") WITHOUT changing your own identity.
+            By default this consumes that lane's copy; pass keep_unread=True to peek only.
     """
     await _heartbeat()
+    # Identity to read/mark AS. Normally me; with as_recipient, another lane (used to
+    # pick up misdirected mail without the set_identity-there-and-back dance).
+    read_identity = as_recipient or current_identity()
+
     # Recency: when checking unread, default to fresh-only. The whole point of "unread"
     # in practice is "did anything just arrive," not "give me 6 months of backlog."
     effective_since = since
@@ -399,7 +483,7 @@ async def read_messages(
         elif unread_only:
             effective_since = _default_since_iso(DEFAULT_FRESHNESS_MINUTES)
 
-    params: dict[str, str] = {"limit": str(limit), "identity": current_identity()}
+    params: dict[str, str] = {"limit": str(limit), "identity": read_identity}
     if unread_only:
         params["unread"] = "true"
     if from_machine:
@@ -408,7 +492,7 @@ async def read_messages(
         params["tag"] = tag
     if effective_since:
         params["since"] = effective_since
-    # Auto-mark on the wire, scoped to my identity: marking read as
+    # Auto-mark on the wire, scoped to read_identity: marking read as
     # 'mac/x#website' does NOT clear the copy for 'mac/x#crypto'.
     if unread_only and not keep_unread:
         params["mark_read"] = "true"
@@ -426,15 +510,24 @@ async def read_messages(
     raw_messages = data.get("messages", [])
     raw_count = len(raw_messages)
 
-    if not all_projects:
-        visible = [m for m in raw_messages if _visible_to_me(m)]
-    else:
+    if all_projects:
         visible = raw_messages
+    else:
+        visible = [m for m in raw_messages if _visible_to(m, read_identity)]
 
     data["messages"] = visible
     data["count"] = len(visible)
     data["filtered_out"] = raw_count - len(visible)
-    data["identity"] = current_identity()
+    data["identity"] = read_identity
+    if as_recipient:
+        data["read_as"] = as_recipient
+        data["your_identity"] = current_identity()
+        data["read_as_note"] = (
+            f"Read on behalf of '{as_recipient}'. Your own identity is unchanged "
+            f"('{current_identity()}'). "
+            + ("Their copy was left unread (peek)." if keep_unread
+               else "Their copy was marked read (pass keep_unread=True to peek instead).")
+        )
     if effective_since:
         data["since"] = effective_since
         data["since_note"] = (
@@ -450,7 +543,9 @@ async def read_messages(
     description=(
         "Quick check — is anything fresh waiting for me? "
         "Defaults to the last 10 minutes (which matches the user saying 'check photon, I just sent it'). "
-        "Reports older_unread_count separately so you know if there's stale backlog without confusing it with new mail."
+        "Reports older_unread_count separately so you know if there's stale backlog without confusing it with new mail. "
+        "Also reports other_lanes_waiting — mail addressed to a different workstream in your project that may have "
+        "been mis-targeted; if the user expected a message that isn't here, that's where to look."
     ),
 )
 async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> dict:
@@ -473,9 +568,29 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
         resp.raise_for_status()
         data = resp.json()
 
-    all_unread = [m for m in data.get("messages", []) if _visible_to_me(m)]
+    raw_unread = data.get("messages", [])
+    all_unread = [m for m in raw_unread if _visible_to_me(m)]
     fresh = [m for m in all_unread if m.get("timestamp", "") > fresh_since]
     older = [m for m in all_unread if m.get("timestamp", "") <= fresh_since]
+
+    # Misdirected-mail discovery: messages addressed to ANOTHER workstream in my
+    # project that the intended lane hasn't read yet. These are invisible to me by
+    # the normal rules, but I can surface a hint so they don't get stuck — the user
+    # can then grab one with read_messages(as_recipient=...). Skip messages the
+    # intended lane already handled (its identity, or '*', is in readBy).
+    my_base = base_identity()
+    other_lanes: dict[str, int] = {}
+    for m in raw_unread:
+        to = m.get("to")
+        if not to or to == current_identity():
+            continue
+        t_base, _t_project, t_ws = _parse_identity(to)
+        if t_base != my_base or t_ws is None:
+            continue  # only sibling #workstreams in my own project
+        read_by = m.get("readBy") or []
+        if to in read_by or "*" in read_by:
+            continue  # the intended lane already read it
+        other_lanes[to] = other_lanes.get(to, 0) + 1
 
     if fresh:
         latest = fresh[0]  # sorted most-recent-first by Worker
@@ -501,6 +616,13 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
             f"Nothing fresh in the last {max_age_minutes} min. "
             f"There are {len(older)} older unread message(s) but the user almost certainly "
             f"did NOT mean those — they're stale. Only surface them if explicitly asked."
+        )
+    if other_lanes:
+        result["other_lanes_waiting"] = other_lanes
+        result["other_lanes_note"] = (
+            "These messages are addressed to OTHER workstreams in your project and the intended "
+            "lane hasn't read them — possibly mis-targeted. If the user expected one here, grab it "
+            "with read_messages(as_recipient='<that identity>') — no need to change your identity."
         )
     return result
 
