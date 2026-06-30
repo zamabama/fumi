@@ -128,11 +128,6 @@ if not API_KEY:
 # Restore a previously-claimed lane for this session (survives subprocess restarts).
 _restore_claim()
 
-# How recent a message must be to count as "fresh" for the default unread fetch.
-# The user's actual workflow: send a message, then immediately go to the recipient
-# agent and ask it to check. Old "unread" backlog is almost never what was meant.
-DEFAULT_FRESHNESS_MINUTES = 10
-
 # Where resolve_project() looks for sibling projects on this machine.
 PROJECT_SEARCH_ROOTS = [Path.home() / "dev", Path.home() / "Documents"]
 PROJECT_SEARCH_MAX_DEPTH = 4
@@ -145,16 +140,15 @@ mcp = FastMCP(
         "Photon — message bridge between Claude Code instances across machines and projects.\n"
         "\n"
         "## At session start\n"
-        "Call check_messages. By default it only surfaces messages from the last "
-        f"{DEFAULT_FRESHNESS_MINUTES} minutes — that is almost always what the user means "
-        "when they say 'check photon' (they just sent something and walked over to you). "
-        "If check_messages returns 0 fresh but reports older_unread_count > 0, do NOT pull "
-        "those old messages unless the user explicitly asks for them. They are stale.\n"
+        "Call check_messages. It reports ALL of your unread mail regardless of age — there is no "
+        "recency window. A queued work assignment can easily be older than the moment you came "
+        "online (the sender dispatched it, then time passed before you checked), so 'older' does "
+        "NOT mean 'stale'. If unread_count > 0, you have real mail waiting — read it.\n"
         "\n"
         "## Reading messages\n"
-        "Use read_messages to actually read what check_messages flagged. By default it "
-        "only returns recent unread and auto-marks them read so they do not pile up. "
-        "If you need older history, pass max_age_minutes= or since=.\n"
+        "Use read_messages to read what check_messages flagged. By default it returns all unread "
+        "addressed to you (any age) and auto-marks them read so they do not pile up. Pass "
+        "max_age_minutes= or since= only if you specifically want to narrow the window.\n"
         "\n"
         "## Sending to another project — you MUST resolve the project first\n"
         "When the user says 'send a photon message to the agent in charge of project X', "
@@ -506,8 +500,8 @@ async def send_message(
 @mcp.tool(
     name="read_messages",
     description=(
-        "Read messages addressed to YOU. Defaults: only fresh unread (last 10 min), auto-marked read. "
-        "Pass max_age_minutes= or since= to look further back. "
+        "Read messages addressed to YOU. Defaults: ALL unread (any age), auto-marked read. "
+        "Pass max_age_minutes= or since= only to narrow the window. "
         "You only ever see your own mail — do NOT try to read other lanes' messages unless the USER "
         "explicitly directs you to. When the user does: as_recipient='mac/<project>#<lane>' reads one "
         "specific other lane's mail (e.g. to pick up something mis-sent there); include_all_lanes=true "
@@ -535,7 +529,7 @@ async def read_messages(
         tag: Filter by tag
         limit: Maximum number of messages to return (default 20)
         all_projects: Set True to bypass all visibility filtering, every project (debugging)
-        max_age_minutes: Only return messages newer than this many minutes (default 10 when unread_only=True; no default otherwise)
+        max_age_minutes: Optional — only return messages newer than this many minutes. No default; all unread is returned regardless of age unless you set this.
         since: ISO timestamp; only return messages newer than this. Overrides max_age_minutes.
         keep_unread: Set True to NOT auto-mark fetched messages as read
         as_recipient: USER-DIRECTED ONLY. Read on behalf of another lane's identity (e.g. to
@@ -553,14 +547,12 @@ async def read_messages(
     # include_all_lanes: every lane in MY project. all_projects: everything, everywhere.
     bypass_visibility = include_all_lanes or all_projects
 
-    # Recency: when checking unread, default to fresh-only. The whole point of "unread"
-    # in practice is "did anything just arrive," not "give me 6 months of backlog."
+    # No recency window: unread mail is surfaced regardless of age (a queued
+    # assignment is often older than when you finally check). Narrow only if the
+    # caller explicitly passes max_age_minutes= or since=.
     effective_since = since
-    if effective_since is None:
-        if max_age_minutes is not None:
-            effective_since = _default_since_iso(max_age_minutes)
-        elif unread_only:
-            effective_since = _default_since_iso(DEFAULT_FRESHNESS_MINUTES)
+    if effective_since is None and max_age_minutes is not None:
+        effective_since = _default_since_iso(max_age_minutes)
 
     params: dict[str, str] = {"limit": str(limit), "identity": read_identity}
     if unread_only:
@@ -631,23 +623,22 @@ async def read_messages(
 @mcp.tool(
     name="check_messages",
     description=(
-        "Quick check — is anything fresh waiting for me? "
-        "Defaults to the last 10 minutes (which matches the user saying 'check photon, I just sent it'). "
-        "Only ever returns mail addressed to YOU. Reports older_unread_count separately so you know if "
-        "there's stale backlog without confusing it with new mail."
+        "Is anything unread waiting for me? Returns ALL unread mail addressed to you, regardless "
+        "of age — there is NO recency window. A queued assignment is often older than the moment "
+        "you check, so 'older' is not 'stale'. If unread_count > 0, read it with read_messages."
     ),
 )
-async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> dict:
-    """Check for FRESH unread messages addressed to this identity.
+async def check_messages(max_age_minutes: int | None = None) -> dict:
+    """Check for unread messages addressed to this identity (all ages by default).
 
     Args:
-        max_age_minutes: How recent counts as 'fresh' (default 10).
+        max_age_minutes: Optional. Only count messages newer than this. No default —
+            omit it to see ALL unread (the normal case).
     """
     await _heartbeat()
-    fresh_since = _default_since_iso(max_age_minutes)
+    since = _default_since_iso(max_age_minutes) if max_age_minutes is not None else None
 
     async with httpx.AsyncClient() as client:
-        # Pull a wider net so we can also report on old backlog without surfacing it.
         resp = await client.get(
             f"{WORKER_URL}/messages",
             headers=_headers(),
@@ -657,14 +648,14 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
         resp.raise_for_status()
         data = resp.json()
 
-    # The Worker only returns mail addressed to me (or my project's broadcasts), so
-    # this is just defence-in-depth — other lanes' messages never arrive here.
-    all_unread = [m for m in data.get("messages", []) if _visible_to_me(m)]
-    fresh = [m for m in all_unread if m.get("timestamp", "") > fresh_since]
-    older = [m for m in all_unread if m.get("timestamp", "") <= fresh_since]
+    # The Worker only returns mail addressed to me (or my project's broadcasts); the
+    # _visible_to_me pass is defence-in-depth. No age filtering unless asked.
+    unread = [m for m in data.get("messages", []) if _visible_to_me(m)]
+    if since is not None:
+        unread = [m for m in unread if m.get("timestamp", "") > since]
 
-    if fresh:
-        latest = fresh[0]  # sorted most-recent-first by Worker
+    if unread:
+        latest = unread[0]  # most-recent-first from the Worker
         latest_info = {
             "from": latest.get("from"),
             "timestamp": latest.get("timestamp"),
@@ -675,19 +666,17 @@ async def check_messages(max_age_minutes: int = DEFAULT_FRESHNESS_MINUTES) -> di
         latest_info = None
 
     result = {
-        "fresh_unread_count": len(fresh),
-        "older_unread_count": len(older),
-        "fresh_window_minutes": max_age_minutes,
-        "fresh_since": fresh_since,
-        "latest_fresh": latest_info,
+        "unread_count": len(unread),
+        "latest": latest_info,
         "identity": current_identity(),
     }
-    if not fresh and older:
+    if unread:
         result["note"] = (
-            f"Nothing fresh in the last {max_age_minutes} min. "
-            f"There are {len(older)} older unread message(s) but the user almost certainly "
-            f"did NOT mean those — they're stale. Only surface them if explicitly asked."
+            f"{len(unread)} unread message(s) addressed to you — read them with read_messages. "
+            "Some may be older queued assignments; older does not mean stale."
         )
+    if max_age_minutes is not None:
+        result["window_minutes"] = max_age_minutes
     return result
 
 

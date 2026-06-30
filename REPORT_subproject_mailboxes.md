@@ -63,6 +63,17 @@ Implements `WP-photon-identity-persistence.md`. Before this, `set_identity` stor
 
 **Acceptance test (needs a real reload, for you to run):** claim a lane → reload the IDE window → `list_identities` shows you still on your lane, and a lane-targeted send arrives — with no manual re-claim.
 
+## Follow-up 4 — removed the 10-minute freshness window (MCP-only, no redeploy)
+
+The server told every agent that `check_messages` only surfaces the last 10 minutes and to treat older unread as stale ("do not pull"). That assumption (`check photon` = the message I just sent) is false for async dispatch: an orchestrator hands out a task, then 20–40 min pass before the agent checks, and the live assignment was hidden as "stale" — agents kept reporting "nothing for me" with real work unread.
+
+**Fix (in `mcp_server.py`):**
+- `check_messages` now returns `unread_count` over **all** unread addressed to you, any age — no window. Removed `fresh_unread_count` / `older_unread_count` / the "they're stale, don't pull" note. `max_age_minutes` is now optional (no default) for explicit narrowing only.
+- `read_messages` no longer imposes the implicit 10-min cap on unread; it returns all unread by default. `max_age_minutes` / `since` still narrow on request.
+- Rewrote the "At session start" / "Reading messages" instructions: older ≠ stale; if `unread_count > 0`, read it. Removed the `DEFAULT_FRESHNESS_MINUTES` constant.
+
+Pairs with the persistence fix — same one-time reload to take effect.
+
 ## Migration
 
 - **No data migration needed.** Legacy messages with `read: true` are treated as read-by-everyone (`readBy` wildcard `*`) so nothing resurfaces; `read: false` stays unread. Old clients that call without an `identity` fall back to the previous global semantics.

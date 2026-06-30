@@ -121,8 +121,8 @@ Once configured, Claude Code gets these tools:
 
 | Tool | Description |
 |------|-------------|
-| `check_messages` | Quick check for **fresh** unread (default last 10 min). Only ever returns mail addressed to you. Reports older backlog separately. |
-| `read_messages` | Read messages addressed to you. Defaults to fresh unread + auto-marks read. `as_recipient=` / `include_all_lanes=` look beyond your lane **only when the user directs you to**. |
+| `check_messages` | Is anything unread for me? Returns **all** unread addressed to you, any age (no recency window). |
+| `read_messages` | Read messages addressed to you. Defaults to all unread + auto-marks read. `as_recipient=` / `include_all_lanes=` look beyond your lane **only when the user directs you to**. |
 | `send_message` | Send a message with optional tags. Refuses cross-project sends without `target=`, and holds sends to a `#workstream` no live agent is using (`allow_unregistered=true` to force). |
 | `set_identity` | Claim a workstream sub-identity (e.g. `"website"`) so this agent gets its own independent read cursor and a roster entry. |
 | `list_identities` | List the agents/workstreams currently active on a project (the roster). Call before `set_identity` or before targeting a specific lane. |
@@ -130,9 +130,9 @@ Once configured, Claude Code gets these tools:
 | `mark_read` | Mark a specific message as read by ID. |
 | `clear_messages` | Delete all messages (requires `confirm=true` safety check). |
 
-### Recency-first reading
+### No recency window — all unread surfaces
 
-`check_messages` and `read_messages` default to the last 10 minutes of unread mail. The reasoning: in practice, "check photon" almost always means *the message I just sent* — old "unread" backlog is noise, not signal. Older unread is reported as a separate `older_unread_count` field so it isn't confused with new mail. Pass `max_age_minutes=` or `since=` to look further back.
+`check_messages` and `read_messages` return **all** of your unread mail regardless of age. There is no "fresh" cutoff. This matters for async dispatch: an orchestrator hands an agent a task, then 20–40 minutes pass before the agent checks — the assignment must still surface, not be hidden as "stale." Pass `max_age_minutes=` or `since=` only if you explicitly want to narrow the window.
 
 ### Cross-project sends
 
