@@ -50,6 +50,19 @@ The first follow-up over-corrected: surfacing `other_lanes_waiting` in `check_me
 - **Cross-lane reads are user-directed only.** `read_messages(as_recipient=…)` (one lane) and the new `read_messages(include_all_lanes=true)` (search all lanes, read-only) exist for "the user told me to look" / "a message should be here but isn't." Server instructions now say emphatically: stay in your lane; act only on what's addressed to you.
 - The send-time dead-lane guard is unchanged (still the best prevention).
 
+## Follow-up 3 — lane persistence across MCP restarts (MCP-only, no redeploy)
+
+Implements `WP-photon-identity-persistence.md`. Before this, `set_identity` stored the lane in-process only, so any MCP subprocess restart (IDE reload / reconnect / idle recycle) silently dropped the agent back to base `mac/primogen` — and lane-targeted mail then failed to deliver (the base identity doesn't receive lane mail). The roster decayed to base within minutes, forcing broadcast-everything.
+
+**Crux (the WP flagged this as solve-first): is a stable per-session key exposed to the MCP subprocess?** Yes — `CLAUDE_CODE_SESSION_ID` is in the subprocess launch env, unique per chat, and durable across restarts (verified: each id has persisted state under `~/.claude/session-env/<id>` and `~/.claude/file-history/<id>`, i.e. it's the resumable session identity, not a per-process value).
+
+**Fix (in `mcp_server.py`):**
+- `set_identity(workstream)` now persists `{session_id → workstream/description/project/machine}` to `~/.photon/claims.json` (machine-local, like the session id); `set_identity('')` removes it.
+- At subprocess boot, `_restore_claim()` reads `CLAUDE_CODE_SESSION_ID` and silently re-claims the stored lane (only if project + machine match), so a reload restores `#crypto` instead of dropping to base — no manual re-call. The first activity heartbeat re-registers it in the roster.
+- An explicit `PHOTON_WORKSTREAM` env still wins; never-claimed agents stay on base; collision rules unchanged.
+
+**Acceptance test (needs a real reload, for you to run):** claim a lane → reload the IDE window → `list_identities` shows you still on your lane, and a lane-targeted send arrives — with no manual re-claim.
+
 ## Migration
 
 - **No data migration needed.** Legacy messages with `read: true` are treated as read-by-everyone (`readBy` wildcard `*`) so nothing resurfaces; `read: false` stays unread. Old clients that call without an `identity` fall back to the previous global semantics.

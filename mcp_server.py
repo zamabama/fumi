@@ -46,6 +46,15 @@ _description = os.environ.get("PHOTON_DESCRIPTION", "").strip() or None
 # from "a different agent tried to claim my workstream label".
 AGENT_TOKEN = uuid.uuid4().hex
 
+# Stable per-session key. Claude Code sets CLAUDE_CODE_SESSION_ID in the MCP
+# subprocess env, and it's the same across a chat's subprocess restarts (IDE
+# reload / reconnect / idle recycle). We key the persisted lane claim on it so a
+# claimed workstream survives a restart instead of silently dropping to base.
+SESSION_ID = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip() or None
+
+# Durable store for per-session lane claims (machine-local, like the session id).
+CLAIMS_PATH = Path.home() / ".photon" / "claims.json"
+
 # Throttle for best-effort presence heartbeats (seconds). Keeps KV writes bounded
 # even with many agents reading frequently.
 _HEARTBEAT_INTERVAL_S = 60
@@ -61,10 +70,63 @@ def current_identity() -> str:
     """This agent's full identity, including its workstream suffix if set."""
     return f"{BASE_IDENTITY}#{_workstream}" if _workstream else BASE_IDENTITY
 
+
+def _load_claims() -> dict:
+    """Read the persisted {session_id -> claim} map (empty on any problem)."""
+    try:
+        return json.loads(CLAIMS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_claim(workstream: str | None, description: str | None) -> None:
+    """Persist (or clear) this session's lane claim. Best-effort; never raises."""
+    if not SESSION_ID:
+        return  # nothing stable to key on → can't persist (single-session is fine on base)
+    claims = _load_claims()
+    if workstream:
+        claims[SESSION_ID] = {
+            "workstream": workstream,
+            "description": description,
+            "project": PROJECT,
+            "machine": MACHINE_ID,
+        }
+    else:
+        claims.pop(SESSION_ID, None)
+    try:
+        CLAIMS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CLAIMS_PATH.write_text(json.dumps(claims, indent=2))
+    except OSError:
+        pass
+
+
+def _restore_claim() -> None:
+    """At startup, silently re-claim this session's persisted lane (if any).
+
+    This is what makes a claimed workstream survive an MCP subprocess restart:
+    a reload boots a fresh process, reads CLAUDE_CODE_SESSION_ID, and restores the
+    stored lane instead of dropping back to the base mailbox.
+    """
+    global _workstream, _description
+    if _workstream or not SESSION_ID:
+        return  # an explicit PHOTON_WORKSTREAM env wins; nothing to restore without a key
+    claim = _load_claims().get(SESSION_ID)
+    if not claim:
+        return
+    # Defensive: only restore a claim made for this same project/machine.
+    if claim.get("project") != PROJECT or claim.get("machine") != MACHINE_ID:
+        return
+    _workstream = claim.get("workstream") or None
+    _description = claim.get("description") or None
+
+
 if not WORKER_URL:
     raise RuntimeError("BRIDGE_WORKER_URL environment variable is required")
 if not API_KEY:
     raise RuntimeError("BRIDGE_API_KEY environment variable is required")
+
+# Restore a previously-claimed lane for this session (survives subprocess restarts).
+_restore_claim()
 
 # How recent a message must be to count as "fresh" for the default unread fetch.
 # The user's actual workflow: send a message, then immediately go to the recipient
@@ -120,6 +182,9 @@ mcp = FastMCP(
         "send with target='mac/<project>#<workstream>' (works cross-project too: "
         "list_identities(project='X')). A lone agent doesn't need any of this — with no workstream "
         "you get the normal single project mailbox, exactly as before.\n"
+        "Your claim PERSISTS across IDE reloads / MCP restarts (it's saved per chat session and "
+        "auto-restored on boot), so you do NOT need to re-call set_identity every session — only to "
+        "CHANGE lanes or to claim one for the first time.\n"
         "\n"
         "## Stay in your lane (IMPORTANT)\n"
         "You ONLY ever receive mail addressed to you (your identity, your project's broadcasts). "
@@ -701,11 +766,20 @@ async def set_identity(workstream: str, description: str = "") -> dict:
         }
     _last_heartbeat = time.time()  # the register above counts as a heartbeat
 
+    # Persist the claim so it survives an MCP restart (keyed on the session id);
+    # clearing the workstream removes the persisted claim too.
+    _save_claim(_workstream, _description)
+
     if _workstream:
+        persist_note = (
+            " It will be auto-restored if this chat's MCP restarts."
+            if SESSION_ID else
+            " (No CLAUDE_CODE_SESSION_ID in this env, so it can't be auto-restored across a restart.)"
+        )
         note = (
             f"This session now reads and sends as '{current_identity()}'. Its read cursor is "
             f"independent from any other workstream at project '{PROJECT}', and it's now listed "
-            "in the roster (list_identities)."
+            f"in the roster (list_identities).{persist_note}"
         )
     else:
         note = f"Workstream cleared. Reading and sending as the base identity '{base_identity()}'."
