@@ -95,6 +95,7 @@ On each machine, add Photon to your project's `.mcp.json` (or create one):
 | `BRIDGE_API_KEY` | Shared secret (same on all machines) |
 | `BRIDGE_MACHINE_ID` | Unique identifier for this machine (e.g. `"mac"`, `"pc"`, `"work-laptop"`) |
 | `BRIDGE_PROJECT` | *(Optional)* Project name for filtering messages across projects |
+| `PHOTON_WORKSTREAM` | *(Optional)* Default workstream sub-identity for this agent (see [Workstreams](#workstreams--multiple-agents-on-one-project)). Usually set at runtime via `set_identity` instead. |
 
 **Windows note:** Use `"python"` instead of `"python3"` for the command.
 
@@ -120,9 +121,11 @@ Once configured, Claude Code gets these tools:
 
 | Tool | Description |
 |------|-------------|
-| `check_messages` | Quick check for **fresh** unread (default last 10 min). Reports older backlog separately. |
-| `read_messages` | Read messages, auto-filtered to your identity. Defaults to fresh unread + auto-marks read. |
-| `send_message` | Send a message with optional tags. Refuses cross-project sends without `target=`. |
+| `check_messages` | Quick check for **fresh** unread (default last 10 min). Reports older backlog and `other_lanes_waiting` (possibly mis-targeted mail) separately. |
+| `read_messages` | Read messages, auto-filtered to your identity. Defaults to fresh unread + auto-marks read. `as_recipient=` reads another lane's mail without switching identity. |
+| `send_message` | Send a message with optional tags. Refuses cross-project sends without `target=`, and holds sends to a `#workstream` no live agent is using (`allow_unregistered=true` to force). |
+| `set_identity` | Claim a workstream sub-identity (e.g. `"website"`) so this agent gets its own independent read cursor and a roster entry. |
+| `list_identities` | List the agents/workstreams currently active on a project (the roster). Call before `set_identity` or before targeting a specific lane. |
 | `resolve_project` | Scan `~/dev` and `~/Documents` for sibling Photon projects. Call before any cross-project send. |
 | `mark_read` | Mark a specific message as read by ID. |
 | `clear_messages` | Delete all messages (requires `confirm=true` safety check). |
@@ -134,6 +137,32 @@ Once configured, Claude Code gets these tools:
 ### Cross-project sends
 
 If you send a message tagged with another project's name but forget `target=`, the server refuses the send (since the message would be silently scoped to your own project and the other agent would never see it). Call `resolve_project(hint='<project>')` first — it returns the correct composite identity to use as `target=`, and warns if the same identity is shared by multiple project directories (the "everyone is `mac/global`" trap).
+
+### Workstreams — multiple agents on one project
+
+By default, every agent opened on the same project root shares one identity (`<machine>/<project>`) and one mailbox. That's fine for a single agent, but if you run several chats/agents on the same project, the first one to read a broadcast marks it read for everyone else.
+
+**Workstreams** fix this. Each agent claims a sub-identity — `<machine>/<project>#<workstream>`, e.g. `mac/primogen#website` — that has its **own independent read cursor**. One agent reading a message never clears it for the others, and a broadcast is seen fresh by every lane.
+
+```
+# At session start, when several agents share a project:
+list_identities()                              # see who's already active / what's taken
+set_identity("website", description="landing redesign")   # claim a free lane
+```
+
+- **Read independence** — `#website` reading mail never affects `#crypto`'s unread state.
+- **Roster** — `set_identity` registers you; agents refresh on activity and drop off after 15 min idle. `list_identities(project="X")` shows the live lanes for your own or another project.
+- **Collision-safe** — claiming a `#workstream` another live agent already holds is refused, so two agents can't silently land on the same cursor. (Base identities without `#` stay shareable — the original single-mailbox behaviour.)
+- **Targeting a lane** — `send_message(target="mac/primogen#website")` reaches just that lane. Cross-project too: `list_identities(project="cocobun")` then target the identity it returns.
+- **Backward compatible** — no workstream means the plain project mailbox, exactly as before.
+
+### Mis-addressed mail
+
+If a message is sent to the wrong lane (`mac/primogen#crypto` when it was meant for `#website`), it's only "addressed to" `#crypto` — so the other lanes don't get it in their normal reads. Three things keep it from getting stuck:
+
+1. **Prevent** — `send_message` to a `#workstream` no live agent is using is **held, not sent**, and returns the current roster so you can pick the right lane. Override with `allow_unregistered=true`.
+2. **Discover** — `check_messages` reports `other_lanes_waiting`, e.g. `{"mac/primogen#crypto": 1}`, for mail addressed to a sibling lane that the intended lane hasn't read yet. So "check photon" surfaces a likely mis-target instead of "nothing fresh."
+3. **Retrieve** — `read_messages(as_recipient="mac/primogen#crypto")` reads that lane's mail in one call **without changing your own identity** — no `set_identity`-there-and-back. Defaults to consuming that lane's copy; pass `keep_unread=true` to peek only.
 
 ### Example usage in conversation
 
@@ -155,15 +184,19 @@ All endpoints require `Authorization: Bearer <key>` header except `/health`.
 | `GET` | `/health` | Health check (no auth required) |
 | `POST` | `/messages` | Send a message |
 | `GET` | `/messages` | List messages |
-| `POST` | `/messages/:id/read` | Mark message as read |
+| `POST` | `/messages/:id/read` | Mark message as read (scoped to `?identity=`) |
 | `DELETE` | `/messages/:id` | Delete a message |
 | `DELETE` | `/messages?confirm=true` | Delete all messages |
+| `POST` | `/presence` | Register / refresh an identity in the roster |
+| `GET` | `/presence?project=` | List active identities for a project |
 
 ### Query parameters for `GET /messages`
 
 | Parameter | Description |
 |-----------|-------------|
 | `unread` | `"true"` to return only unread messages |
+| `identity` | Caller's identity — scopes `unread`/`mark_read` per recipient (so reading as one lane doesn't clear another's). Falls back to legacy global read state if omitted. |
+| `mark_read` | `"true"` to mark the returned messages read for `identity` in the same call |
 | `from` | Filter by sender machine ID |
 | `project` | Filter by project name |
 | `tag` | Filter by tag |
@@ -175,14 +208,17 @@ All endpoints require `Authorization: Bearer <key>` header except `/health`.
 ```json
 {
   "id": "uuid",
-  "from": "mac",
+  "from": "mac/my-project#website",
+  "to": null,
   "project": "my-project",
   "timestamp": "2026-02-28T12:00:00.000Z",
   "content": "Finished the auth refactor. Tests passing. Ready for review.",
   "tags": ["handover", "auth"],
-  "read": false
+  "readBy": ["mac/my-project#website"]
 }
 ```
+
+`readBy` lists the identities that have read the message — read state is **per-recipient**, not a single global flag, so each workstream clears its own copy independently. (`to` is the target identity for a directed send, or `null` for a project broadcast. Messages from before this change used a single `read: true/false` boolean; those are treated as read-by-everyone.)
 
 ## File Structure
 
@@ -191,6 +227,7 @@ photon/
 ├── mcp_server.py        ← MCP server (Python, stdio transport)
 ├── requirements.txt     ← Python dependencies (mcp, httpx)
 ├── README.md
+├── REPORT_subproject_mailboxes.md  ← design notes: workstreams, roster, mis-addressed mail
 └── worker/
     ├── wrangler.toml    ← Cloudflare Worker config
     ├── package.json
