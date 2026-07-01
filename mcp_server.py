@@ -120,6 +120,32 @@ def _restore_claim() -> None:
     _description = claim.get("description") or None
 
 
+def _write_session_runtime() -> None:
+    """Drop this session's Photon config where photon_watch.py can find it.
+
+    The watcher runs in the agent's Bash shell, which has CLAUDE_CODE_SESSION_ID
+    but NOT the BRIDGE_* env — so we can't pass the config (or the secret) through
+    the model. Instead the MCP server, which does have them, writes a session-keyed
+    file (chmod 600) that the watcher reads by session id. The key is already on
+    disk in .mcp.json; this is the same trust boundary.
+    """
+    if not SESSION_ID:
+        return
+    path = Path.home() / ".photon" / f"session-{SESSION_ID}.json"
+    data = {
+        "worker_url": WORKER_URL,
+        "api_key": API_KEY,
+        "machine": MACHINE_ID,
+        "project": PROJECT,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 if not WORKER_URL:
     raise RuntimeError("BRIDGE_WORKER_URL environment variable is required")
 if not API_KEY:
@@ -128,9 +154,16 @@ if not API_KEY:
 # Restore a previously-claimed lane for this session (survives subprocess restarts).
 _restore_claim()
 
+# Publish this session's config so the Monitor-armed inbox watcher can self-configure.
+_write_session_runtime()
+
 # Where resolve_project() looks for sibling projects on this machine.
 PROJECT_SEARCH_ROOTS = [Path.home() / "dev", Path.home() / "Documents"]
 PROJECT_SEARCH_MAX_DEPTH = 4
+
+# The inbox watcher that agents arm via the Monitor tool for auto-notification.
+# Sibling of this file, so the path is correct wherever the repo lives.
+WATCH_SCRIPT = str(Path(__file__).resolve().parent / "photon_watch.py")
 
 # --- MCP Server ---
 
@@ -149,6 +182,16 @@ mcp = FastMCP(
         "Use read_messages to read what check_messages flagged. By default it returns all unread "
         "addressed to you (any age) and auto-marks them read so they do not pile up. Pass "
         "max_age_minutes= or since= only if you specifically want to narrow the window.\n"
+        "\n"
+        "## Auto-notify — arm your inbox watcher (recommended, once per session)\n"
+        "So you learn about new mail WITHOUT the user having to tell you to check, arm a background "
+        "watcher once at session start using the Monitor tool:\n"
+        f"    Monitor(command=\"python3 {WATCH_SCRIPT}\", persistent=true, description=\"photon inbox\")\n"
+        "It polls cheaply (no model cost) and emits an event — waking you — ONLY when a NEW message "
+        "addressed to your identity arrives; it stays silent otherwise and does not re-announce mail "
+        "you already had. When such an event arrives, read it with read_messages and act. Re-arm "
+        "after an IDE reload / MCP restart (a fresh session needs a fresh watcher). If you set or "
+        "change your workstream with set_identity, re-arm so the watcher follows your new lane.\n"
         "\n"
         "## Sending to another project — you MUST resolve the project first\n"
         "When the user says 'send a photon message to the agent in charge of project X', "

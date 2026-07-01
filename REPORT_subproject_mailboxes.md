@@ -74,6 +74,17 @@ The server told every agent that `check_messages` only surfaces the last 10 minu
 
 Pairs with the persistence fix — same one-time reload to take effect.
 
+## Follow-up 5 — auto-notify (no manual "check photon")
+
+Agents no longer need to be told to check. `photon_watch.py` is a non-LLM poller run through Claude Code's `Monitor` tool: it polls the Worker for unread mail addressed to the agent's identity every ~30s and emits a line **only when new mail arrives**, which Monitor delivers as an async event that **wakes the agent**. The model is invoked only when there's real mail; idle cost is one small KV read per interval (free-tier trivial even across many agents). This is the "cheap poller + wake-on-message" design (Option 3 from the architecture discussion), realized with a native primitive instead of an external daemon.
+
+- **Wake mechanism validated** end-to-end: a Monitor event re-invokes an idle session; the watcher fires a `📬 PHOTON: …` event on a genuinely new message and stays silent on existing backlog.
+- **Self-configuring, no secrets through the model:** the agent's Bash shell has `CLAUDE_CODE_SESSION_ID` but not the `BRIDGE_*` env, so the MCP server writes `~/.photon/session-<id>.json` (chmod 600, key + worker URL + machine/project) on boot; the watcher reads it by session id and resolves its identity (including a restored workstream from `claims.json`). Falls back to env / `.mcp.json`.
+- **Gotcha fixed:** stdlib `urllib`'s default User-Agent trips Cloudflare's bad-bot rule (HTTP 403 / error 1010) — the watcher sends `User-Agent: photon-watch/1.0`. It also surfaces persistent fetch failures loudly instead of looking like "no mail."
+- **Arming:** the MCP server instructions tell each agent to run the `Monitor(...)` line once per session (re-arm after reload / lane change). A `SessionStart` hook can reinforce it.
+
+Client-side; activates on the same reload as the other follow-ups.
+
 ## Migration
 
 - **No data migration needed.** Legacy messages with `read: true` are treated as read-by-everyone (`readBy` wildcard `*`) so nothing resurfaces; `read: false` stays unread. Old clients that call without an `identity` fall back to the previous global semantics.

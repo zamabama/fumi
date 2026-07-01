@@ -134,6 +134,18 @@ Once configured, Claude Code gets these tools:
 
 `check_messages` and `read_messages` return **all** of your unread mail regardless of age. There is no "fresh" cutoff. This matters for async dispatch: an orchestrator hands an agent a task, then 20–40 minutes pass before the agent checks — the assignment must still surface, not be hidden as "stale." Pass `max_age_minutes=` or `since=` only if you explicitly want to narrow the window.
 
+### Auto-notify — get pinged when mail arrives (no manual "check photon")
+
+`photon_watch.py` is a lightweight, **non-LLM** poller you run through Claude Code's `Monitor` tool. It checks the Worker for unread mail addressed to your identity every ~30s and prints a line **only when a new message arrives** — which `Monitor` delivers as an async event that wakes the agent. So the model is invoked *only* when there's actually mail; empty polls cost nothing but a tiny KV read (well within the free tier even with many agents).
+
+An agent arms it once per session (the MCP server instructs this automatically):
+
+```
+Monitor(command="python3 /path/to/photon/photon_watch.py", persistent=true, description="photon inbox")
+```
+
+It self-configures with **no secrets passed through the model**: the MCP server writes `~/.photon/session-<CLAUDE_CODE_SESSION_ID>.json` (chmod 600) on boot, and the watcher reads it by session id to get the Worker URL/key and its identity (including any restored workstream). It suppresses the existing backlog on arm (no re-notifying mail you already had) and only announces new arrivals. Re-arm after an IDE reload or a `set_identity` lane change. For stronger automation, add a `SessionStart` hook that nudges the agent to arm it.
+
 ### Cross-project sends
 
 If you send a message tagged with another project's name but forget `target=`, the server refuses the send (since the message would be silently scoped to your own project and the other agent would never see it). Call `resolve_project(hint='<project>')` first — it returns the correct composite identity to use as `target=`, and warns if the same identity is shared by multiple project directories (the "everyone is `mac/global`" trap).
@@ -232,6 +244,7 @@ All endpoints require `Authorization: Bearer <key>` header except `/health`.
 ```
 photon/
 ├── mcp_server.py        ← MCP server (Python, stdio transport)
+├── photon_watch.py      ← inbox watcher for auto-notify (run via the Monitor tool)
 ├── requirements.txt     ← Python dependencies (mcp, httpx)
 ├── README.md
 ├── REPORT_subproject_mailboxes.md  ← design notes: workstreams, roster, mis-addressed mail
